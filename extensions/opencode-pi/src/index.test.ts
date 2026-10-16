@@ -11,6 +11,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { stopOpenCodeServer } from "./server.js";
 import test from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { normalizeContext } from "@earendil-works/pi-ai";
@@ -20,6 +21,7 @@ import {
 } from "@earendil-works/pi-ai/compat";
 import type {
   Api,
+  SimpleStreamOptions,
   AssistantMessageEvent,
   Context,
   Message,
@@ -38,7 +40,6 @@ import opencodePiExtension, {
   parseVerboseModels,
   piArguments,
   openCodeToolArgs,
-  reasoningCliArgs,
   resolveTurnTimeoutMs,
   streamOpenCode,
   showOpenCodePanelList,
@@ -72,17 +73,158 @@ function fakeContext(toolNames: string[] = []): Context {
   };
 }
 
-function fakeEventScript(events: unknown[]): string {
-  return `for (const event of ${JSON.stringify(events)}) process.stdout.write(JSON.stringify(event) + "\\n");`;
+type FakeServerConfig = {
+  /** Appends one JSON line per server request (except event streams). */
+  capturePath?: string;
+  /** Written when the fake server starts. */
+  sentinelPath?: string;
+  /** Returned by POST /session. */
+  sessionId?: string;
+  /** Server events sent after a prompt; `{ waitFor: path }` pauses until the file exists. */
+  events?: unknown[];
+  /** Send session.status idle after the events (default true). */
+  idle?: boolean;
+};
+
+const DEFAULT_TURN_EVENTS = [
+  textPart("prt_hello", "hello"),
+  stepFinish("stop", { total: 10, input: 5, output: 5, reasoning: 0, cache: { read: 0, write: 0 } }),
+];
+
+/**
+ * A fake `opencode` binary whose `serve` command speaks the subset of the
+ * OpenCode server API the bridge uses. Each prompt replays the scripted
+ * events with the session ID filled in.
+ */
+function fakeServer(config: FakeServerConfig = {}): string {
+  return `const fs = require("node:fs");
+const path = require("node:path");
+const http = require("node:http");
+const config = ${JSON.stringify({ ...config, events: config.events ?? DEFAULT_TURN_EVENTS })};
+if (process.argv[2] === "session") process.exit(0);
+if (process.argv[2] !== "serve") process.exit(1);
+if (config.sentinelPath) fs.writeFileSync(config.sentinelPath, "ran");
+const auth = "Basic " + Buffer.from("opencode:" + process.env.OPENCODE_SERVER_PASSWORD).toString("base64");
+const clients = new Set();
+let created = 0;
+const record = (entry) => { if (config.capturePath) fs.appendFileSync(config.capturePath, JSON.stringify(entry) + "\\n"); };
+const send = (event) => { for (const res of clients) res.write("data: " + JSON.stringify(event) + "\\n\\n"); };
+const wait = (file) => new Promise((resolve) => { const check = () => fs.existsSync(file) ? resolve() : setTimeout(check, 5); check(); });
+const withSession = (event, sessionID) => {
+  const copy = JSON.parse(JSON.stringify(event));
+  copy.properties = copy.properties || {};
+  if (copy.properties.part) copy.properties.part.sessionID = sessionID;
+  else copy.properties.sessionID = sessionID;
+  return copy;
+};
+http.createServer((req, res) => {
+  let body = "";
+  req.on("data", (chunk) => { body += chunk; });
+  req.on("end", async () => {
+    if (req.headers.authorization !== auth) { res.writeHead(401); res.end(); return; }
+    const url = new URL(req.url, "http://fake");
+    const directory = url.searchParams.get("directory");
+    if (url.pathname === "/event") {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      clients.add(res);
+      res.on("close", () => clients.delete(res));
+      res.write("data: " + JSON.stringify({ type: "server.connected", properties: {} }) + "\\n\\n");
+      return;
+    }
+    const entry = { method: req.method, path: url.pathname, directory, body: body ? JSON.parse(body) : undefined };
+    if (url.pathname === "/session") {
+      created += 1;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ id: config.sessionId || "ses-fake" }));
+      return;
+    }
+    const prompt = url.pathname.match(/^\\/session\\/([^/]+)\\/prompt_async$/);
+    if (!prompt) {
+      record(entry);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("true");
+      return;
+    }
+    const sessionID = prompt[1];
+    record({
+      ...entry,
+      sessionID,
+      continued: created === 0,
+      text: entry.body.parts.at(-1).text,
+      tools: fs.readdirSync(path.join(directory, ".opencode", "tools")).sort(),
+      agent: fs.readFileSync(path.join(directory, ".opencode", "agents", "pi-model.md"), "utf8"),
+    });
+    res.writeHead(204);
+    res.end();
+    for (const event of config.events) {
+      if (event.waitFor) await wait(event.waitFor);
+      else send(withSession(event, sessionID));
+    }
+    if (config.idle !== false) send(withSession({ type: "session.status", properties: { status: { type: "idle" } } }, sessionID));
+  });
+}).listen(0, "127.0.0.1", function () {
+  console.log("opencode server listening on http://127.0.0.1:" + this.address().port);
+});
+`;
+}
+
+function textPart(id: string, text: string, type = "text") {
+  return { type: "message.part.updated", properties: { part: { id, type, text, time: { start: 1, end: 2 } } } };
+}
+
+function partStart(id: string, type = "text") {
+  return { type: "message.part.updated", properties: { part: { id, type, text: "", time: { start: 1 } } } };
+}
+
+function partDelta(partID: string, delta: string) {
+  return { type: "message.part.delta", properties: { partID, field: "text", delta } };
+}
+
+function toolPart(tool: string, callID: string, status: string, input: unknown) {
+  return { type: "message.part.updated", properties: { part: { id: `prt_${callID}`, type: "tool", tool, callID, state: { status, input } } } };
+}
+
+function stepFinish(reason: string, tokens?: unknown) {
+  return { type: "message.part.updated", properties: { part: { id: `prt_finish_${reason}`, type: "step-finish", reason, tokens } } };
+}
+
+function sessionError(message: string) {
+  return { type: "session.error", properties: { error: { name: "UnknownError", data: { message } } } };
+}
+
+type Captured = {
+  method: string;
+  path: string;
+  directory: string;
+  body?: any;
+  sessionID?: string;
+  continued?: boolean;
+  text?: string;
+  tools?: string[];
+  agent?: string;
+};
+
+function readCaptured(capturePath: string): Captured[] {
+  if (!existsSync(capturePath)) return [];
+  return readFileSync(capturePath, "utf8")
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+}
+
+/** Only the prompt requests, one per turn. */
+function readInvocations(capturePath: string): Captured[] {
+  return readCaptured(capturePath).filter((entry) => entry.path.endsWith("/prompt_async"));
 }
 
 async function collectStreamEvents(
   script: string,
   context: Context,
+  options?: SimpleStreamOptions,
 ): Promise<AssistantMessageEvent[]> {
   return withFakeOpenCode(script, async () => {
     const events: AssistantMessageEvent[] = [];
-    for await (const event of streamOpenCode(fakeModel(), context)) {
+    for await (const event of streamOpenCode(fakeModel(), context, options)) {
       events.push(event);
     }
     return events;
@@ -144,6 +286,7 @@ async function withFakeOpenCode<T>(
   try {
     return await run();
   } finally {
+    stopOpenCodeServer();
     restoreEnv("OPENCODE_PI_BIN", previousBin);
     rmSync(dir, { recursive: true, force: true });
   }
@@ -169,10 +312,7 @@ async function invalidImageResult(
   const sentinelPath = join(sentinelDir, "ran.marker");
   try {
     const message = await withFakeOpenCode(
-      `const fs = require("node:fs");
-fs.writeFileSync(${JSON.stringify(sentinelPath)}, "ran");
-process.stdout.write(JSON.stringify({ type: "text", part: { text: "ok" } }) + "\\n");
-`,
+      fakeServer({ sentinelPath }),
       () =>
         streamOpenCode(
           { ...fakeModel(), input: ["text", "image"] },
@@ -263,19 +403,6 @@ test("parseVerboseModels maps an OpenCode off variant to Pi off", () => {
     high: null,
     xhigh: null,
   });
-});
-
-test("reasoningCliArgs respects off, selected levels, and provider defaults", () => {
-  const map = { off: "none", low: "low" } as const;
-
-  assert.deepEqual(reasoningCliArgs("off", map), []);
-  assert.deepEqual(reasoningCliArgs("low", map), [
-    "--thinking",
-    "--variant",
-    "low",
-  ]);
-  assert.deepEqual(reasoningCliArgs(undefined, map), []);
-  assert.deepEqual(reasoningCliArgs("high", map), ["--thinking"]);
 });
 
 test("imageContentsForModel omits historical images for text-only models", () => {
@@ -418,7 +545,9 @@ test("writeBridgeConfig refuses Pi tool names OpenCode cannot load", async () =>
   }
 });
 
-test("streamOpenCode turns OpenCode tool_use events into Pi tool calls", async () => {
+test("streamOpenCode turns finished Pi tool parts into Pi tool calls", async () => {
+  const captureDir = mkdtempSync(join(tmpdir(), "opencode-pi-capture-"));
+  const capturePath = join(captureDir, "requests.jsonl");
   const context: Context = {
     messages: [],
     tools: [
@@ -429,84 +558,119 @@ test("streamOpenCode turns OpenCode tool_use events into Pi tool calls", async (
       }),
     ],
   };
-  const events = await collectStreamEvents(
-    fakeEventScript([
-      { type: "text", part: { text: "Reading it." } },
-      {
-        type: "tool_use",
-        part: { tool: "read", callID: "call_1", state: { status: "error", input: { path: "README.md", limit: null } } },
-      },
-      // A call to an unavailable stub already got its answer inside OpenCode.
-      { type: "tool_use", part: { tool: "apply_patch", callID: "call_2", state: { status: "completed", input: {} } } },
-      { type: "step_finish", part: { reason: "tool-calls" } },
-    ]),
-    context,
-  );
+  try {
+    const events = await collectStreamEvents(
+      fakeServer({
+        capturePath,
+        events: [
+          textPart("prt_text", "Reading it."),
+          toolPart("read", "call_1", "pending", {}),
+          { type: "permission.asked", properties: { id: "per_1", permission: "pi_tool" } },
+          toolPart("read", "call_1", "error", { path: "README.md", limit: null }),
+          // A call to an unavailable stub already got its answer inside OpenCode.
+          toolPart("apply_patch", "call_2", "completed", {}),
+          stepFinish("tool-calls"),
+        ],
+      }),
+      context,
+    );
 
-  assert.deepEqual(
-    events.map((event) => event.type),
-    ["start", "text_start", "text_delta", "text_end", "toolcall_start", "toolcall_delta", "toolcall_end", "done"],
-  );
-  const done = events.at(-1);
-  assert.equal(done?.type, "done");
-  if (done?.type !== "done") return;
-  assert.equal(done.reason, "toolUse");
-  assert.deepEqual(done.message.content, [
-    { type: "text", text: "Reading it." },
-    { type: "toolCall", id: "call_1", name: "read", arguments: { path: "README.md" } },
-  ]);
+    assert.deepEqual(
+      events.map((event) => event.type),
+      ["start", "text_start", "text_delta", "text_end", "toolcall_start", "toolcall_delta", "toolcall_end", "done"],
+    );
+    const done = events.at(-1);
+    assert.equal(done?.type, "done");
+    if (done?.type !== "done") return;
+    assert.equal(done.reason, "toolUse");
+    assert.deepEqual(done.message.content, [
+      { type: "text", text: "Reading it." },
+      { type: "toolCall", id: "call_1", name: "read", arguments: { path: "README.md" } },
+    ]);
+    // The bridge rejects the pi_tool ask so OpenCode never runs the tool.
+    const reply = readCaptured(capturePath).find((entry) => entry.path === "/permission/per_1/reply");
+    assert.deepEqual(reply?.body, { reply: "reject" });
+  } finally {
+    rmSync(captureDir, { recursive: true, force: true });
+  }
 });
 
-test("streamOpenCode diagnoses empty provider output with detailed context", async () => {
-  const message = await withFakeOpenCode("", () =>
+test("streamOpenCode streams text deltas before the turn finishes", async () => {
+  const gateDir = mkdtempSync(join(tmpdir(), "opencode-pi-gate-"));
+  const gate = join(gateDir, "first-delta-seen");
+  try {
+    const events = await withFakeOpenCode(
+      fakeServer({
+        events: [
+          partStart("prt_think", "reasoning"),
+          partDelta("prt_think", "Plan"),
+          textPart("prt_think", "Plan.", "reasoning"),
+          partStart("prt_text"),
+          partDelta("prt_text", "Hel"),
+          // The server holds the rest of the turn until Pi has seen a delta.
+          { waitFor: gate },
+          partDelta("prt_text", "lo"),
+          textPart("prt_text", "Hello!"),
+          stepFinish("stop"),
+        ],
+      }),
+      async () => {
+        const seen: AssistantMessageEvent[] = [];
+        for await (const event of streamOpenCode(fakeModel(), fakeContext())) {
+          seen.push(event);
+          if (event.type === "text_delta") writeFileSync(gate, "");
+        }
+        return seen;
+      },
+    );
+
+    assert.deepEqual(
+      events.map((event) => (event.type.endsWith("_delta") ? `${event.type}:${(event as { delta: string }).delta}` : event.type)),
+      [
+        "start",
+        "thinking_start", "thinking_delta:Plan", "thinking_delta:.", "thinking_end",
+        "text_start", "text_delta:Hel", "text_delta:lo", "text_delta:!", "text_end",
+        "done",
+      ],
+    );
+    const done = events.at(-1);
+    if (done?.type !== "done") return assert.fail("expected done");
+    assert.deepEqual(done.message.content, [
+      { type: "thinking", thinking: "Plan." },
+      { type: "text", text: "Hello!" },
+    ]);
+  } finally {
+    rmSync(gateDir, { recursive: true, force: true });
+  }
+});
+
+test("streamOpenCode diagnoses empty provider output", async () => {
+  const message = await withFakeOpenCode(fakeServer({ events: [] }), () =>
     streamOpenCode(fakeModel(), fakeContext()).result(),
   );
 
   assert.equal(message.stopReason, "error");
-  assert.ok(
-    message.errorMessage?.includes("empty assistant response"),
-    "should mention empty assistant response",
-  );
-  assert.ok(
-    message.errorMessage?.includes("no text events received"),
-    "should include raw text context",
-  );
-  assert.ok(
-    message.errorMessage?.includes("Retry the request or select another OpenCode model"),
-    "should suggest retry",
-  );
+  assert.match(message.errorMessage ?? "", /empty assistant response \(no text\)/);
+  assert.match(message.errorMessage ?? "", /Retry the request or select another OpenCode model/);
 });
 
-test("streamOpenCode diagnoses empty output with whitespace-only text events", async () => {
-  const message = await collectStreamEvents(
-    fakeEventScript([
-      { type: "text", part: { text: "   \n\n   " } },
-    ]),
-    fakeContext(["read"]),
+test("streamOpenCode diagnoses empty output with whitespace-only text", async () => {
+  const message = await withFakeOpenCode(
+    fakeServer({ events: [textPart("prt_ws", "   \n\n   ")] }),
+    () => streamOpenCode(fakeModel(), fakeContext(["read"])).result(),
   );
 
-  const error = message.find((e) => e.type === "error");
-  assert.ok(error, "should emit an error event");
-  assert.equal(error?.type, "error");
-  if (error?.type !== "error") return;
-
-  assert.ok(
-    error.error?.errorMessage?.includes("empty assistant response"),
-    "should diagnose whitespace-only text as empty response",
-  );
-  assert.ok(
-    error.error?.errorMessage?.includes("raw text length="),
-    "should include raw text length in diagnostic",
-  );
+  assert.equal(message.stopReason, "error");
+  assert.match(message.errorMessage ?? "", /empty assistant response \(whitespace-only text, length=8\)/);
 });
 
-test("streamOpenCode never spawns opencode when the signal aborts before the child is launched", async () => {
+test("streamOpenCode never starts opencode when the signal aborts before setup", async () => {
   const sentinelDir = mkdtempSync(join(tmpdir(), "opencode-pi-sentinel-"));
   const sentinelPath = join(sentinelDir, "ran.marker");
 
   try {
     const message = await withFakeOpenCode(
-      `require("node:fs").writeFileSync(${JSON.stringify(sentinelPath)}, "ran");`,
+      fakeServer({ sentinelPath }),
       () =>
         streamOpenCode(fakeModel(), fakeContext(), {
           signal: abortAfterFirstCheck(),
@@ -520,31 +684,32 @@ test("streamOpenCode never spawns opencode when the signal aborts before the chi
   }
 });
 
-test("streamOpenCode spawns opencode and returns its output when not aborted", async () => {
+test("streamOpenCode starts opencode and returns its output when not aborted", async () => {
   const sentinelDir = mkdtempSync(join(tmpdir(), "opencode-pi-sentinel-"));
   const sentinelPath = join(sentinelDir, "ran.marker");
 
   try {
     const message = await withFakeOpenCode(
-      `require("node:fs").writeFileSync(${JSON.stringify(sentinelPath)}, "ran");
-process.stdout.write(JSON.stringify({ type: "text", part: { text: "ok" } }) + "\\n");`,
+      fakeServer({ sentinelPath }),
       () => streamOpenCode(fakeModel(), fakeContext()).result(),
     );
 
     assert.equal(existsSync(sentinelPath), true);
     assert.equal(message.stopReason, "stop");
+    assert.deepEqual(message.content, [{ type: "text", text: "hello" }]);
+    assert.equal(message.usage.totalTokens, 10);
   } finally {
     rmSync(sentinelDir, { recursive: true, force: true });
   }
 });
 
-test("streamOpenCode never spawns opencode when the signal aborts after image file setup", async () => {
+test("streamOpenCode never starts opencode when the signal aborts after image setup", async () => {
   const sentinelDir = mkdtempSync(join(tmpdir(), "opencode-pi-sentinel-"));
   const sentinelPath = join(sentinelDir, "ran.marker");
 
   try {
     const message = await withFakeOpenCode(
-      `require("node:fs").writeFileSync(${JSON.stringify(sentinelPath)}, "ran");`,
+      fakeServer({ sentinelPath }),
       () =>
         streamOpenCode(fakeModel(), fakeContext(), {
           signal: abortAfterSecondCheck(),
@@ -558,27 +723,20 @@ test("streamOpenCode never spawns opencode when the signal aborts after image fi
   }
 });
 
-test("streamOpenCode succeeds when opencode emits reasoning-only output with no text or tool calls", async () => {
+test("streamOpenCode succeeds with reasoning-only output", async () => {
   const message = await withFakeOpenCode(
-    `process.stdout.write(JSON.stringify({ type: "reasoning", part: { text: "thinking it through" } }) + "\\n");`,
+    fakeServer({ events: [textPart("prt_r", "thinking it through", "reasoning")] }),
     () => streamOpenCode(fakeModel(), fakeContext()).result(),
   );
 
   assert.equal(message.stopReason, "stop");
   assert.equal(message.errorMessage, undefined);
-  const thinkingBlock = message.content.find(
-    (block) => block.type === "thinking",
-  );
-  assert.equal(thinkingBlock?.thinking, "thinking it through");
-  assert.equal(
-    message.content.some((block) => block.type === "text"),
-    false,
-  );
+  assert.deepEqual(message.content, [{ type: "thinking", thinking: "thinking it through" }]);
 });
 
 test("streamOpenCode returns the expected error outcome when opencode times out", async () => {
   const message = await withFakeOpenCode(
-    "setInterval(() => undefined, 1_000);",
+    fakeServer({ events: [], idle: false }),
     () =>
       streamOpenCode(fakeModel(), fakeContext(), {
         timeoutMs: 30,
@@ -589,9 +747,44 @@ test("streamOpenCode returns the expected error outcome when opencode times out"
   assert.equal(message.errorMessage, "opencode timed out after 30ms");
 });
 
-test("streamOpenCode forwards reasoning settings and image files to opencode", async () => {
+test("streamOpenCode aborts the OpenCode session when Pi aborts mid-turn", async () => {
   const captureDir = mkdtempSync(join(tmpdir(), "opencode-pi-capture-"));
-  const capturePath = join(captureDir, "invocation.json");
+  const capturePath = join(captureDir, "requests.jsonl");
+  const controller = new AbortController();
+  try {
+    const events = await withFakeOpenCode(
+      fakeServer({
+        capturePath,
+        sessionId: "ses-abort",
+        events: [partStart("prt_text"), partDelta("prt_text", "partial")],
+        idle: false,
+      }),
+      async () => {
+        const seen: AssistantMessageEvent[] = [];
+        for await (const event of streamOpenCode(fakeModel(), fakeContext(), { signal: controller.signal })) {
+          seen.push(event);
+          if (event.type === "text_delta") controller.abort();
+        }
+        return seen;
+      },
+    );
+
+    const error = events.at(-1);
+    if (error?.type !== "error") return assert.fail("expected error");
+    assert.equal(error.reason, "aborted");
+    assert.equal(error.error.errorMessage, "Request was aborted");
+    // The streamed text block is closed and kept.
+    assert.deepEqual(error.error.content, [{ type: "text", text: "partial" }]);
+    assert.ok(events.some((event) => event.type === "text_end"));
+    assert.ok(readCaptured(capturePath).some((entry) => entry.path === "/session/ses-abort/abort"));
+  } finally {
+    rmSync(captureDir, { recursive: true, force: true });
+  }
+});
+
+test("streamOpenCode sends the agent, model, reasoning variant, and images", async () => {
+  const captureDir = mkdtempSync(join(tmpdir(), "opencode-pi-capture-"));
+  const capturePath = join(captureDir, "requests.jsonl");
   const model: Model<Api> = {
     ...fakeModel(),
     reasoning: true,
@@ -601,16 +794,7 @@ test("streamOpenCode forwards reasoning settings and image files to opencode", a
 
   try {
     const message = await withFakeOpenCode(
-      `const fs = require("node:fs");
-const args = process.argv.slice(2);
-const fileIndex = args.indexOf("--file");
-const imagePath = args[fileIndex + 1];
-fs.writeFileSync(${JSON.stringify(capturePath)}, JSON.stringify({
-  args,
-  imagePath,
-  imageHex: fs.readFileSync(imagePath).toString("hex"),
-}));
-process.stdout.write(JSON.stringify({ type: "text", part: { text: "ok" } }) + "\\n");`,
+      fakeServer({ capturePath }),
       () =>
         streamOpenCode(
           model,
@@ -619,100 +803,141 @@ process.stdout.write(JSON.stringify({ type: "text", part: { text: "ok" } }) + "\
         ).result(),
     );
 
-    const invocation = JSON.parse(readFileSync(capturePath, "utf8")) as {
-      args: string[];
-      imagePath: string;
-      imageHex: string;
-    };
     assert.equal(message.stopReason, "stop");
-    assert.deepEqual(invocation.args.slice(0, 8), [
-      "run",
-      "--pure",
-      "-m",
-      "opencode/fake-free",
-      "--agent",
-      "pi-model",
-      "--format",
-      "json",
-    ]);
-    assert.deepEqual(invocation.args.slice(-5), [
-      "--thinking",
-      "--variant",
-      "max",
-      "--file",
-      invocation.imagePath,
-    ]);
-    assert.equal(invocation.imagePath.endsWith("pi-images/image-001.png"), true);
-    assert.equal(
-      invocation.imageHex,
-      Buffer.from("image bytes").toString("hex"),
-    );
+    const invocation = readInvocations(capturePath)[0];
+    assert.equal(invocation?.body.agent, "pi-model");
+    assert.deepEqual(invocation?.body.model, { providerID: "opencode", modelID: "fake-free" });
+    assert.equal(invocation?.body.variant, "max");
+    assert.deepEqual(invocation?.body.parts[0], {
+      type: "file",
+      mime: "image/png",
+      filename: "image-001.png",
+      url: `data:image/png;base64,${Buffer.from("image bytes").toString("base64")}`,
+    });
+    assert.match(invocation?.agent ?? "", /mode: primary/);
+    assert.match(invocation?.agent ?? "", /\n  "read": allow\n/);
+    assert.match(invocation?.directory ?? "", /opencode-pi-/);
   } finally {
     rmSync(captureDir, { recursive: true, force: true });
   }
 });
 
-test("streamOpenCode uses v2 model variants and isolated project agent without v1 flags", async () => {
+test("streamOpenCode omits the variant when the model has none for the level", async () => {
+  const captureDir = mkdtempSync(join(tmpdir(), "opencode-pi-capture-"));
+  const capturePath = join(captureDir, "requests.jsonl");
+  try {
+    const message = await withFakeOpenCode(
+      fakeServer({ capturePath }),
+      () => streamOpenCode(fakeModel(), fakeContext(), { reasoning: "low" }).result(),
+    );
+    assert.equal(message.stopReason, "stop");
+    assert.equal("variant" in (readInvocations(capturePath)[0]?.body ?? {}), false);
+  } finally {
+    rmSync(captureDir, { recursive: true, force: true });
+  }
+});
+
+test("streamOpenCode runs OpenCode v2 turns through opencode run", async () => {
   const captureDir = mkdtempSync(join(tmpdir(), "opencode-pi-v2-capture-"));
   const capturePath = join(captureDir, "invocation.json");
   const model: Model<Api> = {
     ...fakeModel(),
     reasoning: true,
+    input: ["text", "image"],
     thinkingLevelMap: { low: "low" },
   };
+  const context = imageContext("image/png", Buffer.from("image bytes").toString("base64"));
+  context.tools = fakeContext(["read"]).tools;
   try {
-    await withFakeOpenCode(
+    const events = await withFakeOpenCode(
       `const fs = require("node:fs");
-fs.writeFileSync(${JSON.stringify(capturePath)}, JSON.stringify({
-  args: process.argv.slice(2),
-  cwd: process.cwd(),
-  agent: fs.readFileSync(".opencode/agents/pi-model.md", "utf8"),
-}));
-process.stdout.write(JSON.stringify({ type: "text", part: { text: "ok" } }) + "\\n");`,
+if (process.argv[2] === "session") process.exit(0);
+let stdin = "";
+process.stdin.on("data", (chunk) => { stdin += chunk; });
+process.stdin.on("end", () => {
+  const args = process.argv.slice(2);
+  const image = args[args.indexOf("--file") + 1];
+  fs.writeFileSync(${JSON.stringify(capturePath)}, JSON.stringify({
+    args, stdin, cwd: process.cwd(),
+    imageHex: fs.readFileSync(image).toString("hex"),
+    agent: fs.readFileSync(".opencode/agents/pi-model.md", "utf8"),
+  }));
+  const emit = (type, part) => process.stdout.write(JSON.stringify({ type, sessionID: "ses-v2", part }) + "\\n");
+  emit("reasoning", { id: "prt_r", type: "reasoning", text: "Plan.", time: { start: 1, end: 2 } });
+  emit("text", { id: "prt_t", type: "text", text: "Reading it.", time: { start: 2, end: 3 } });
+  emit("tool_use", { partID: "prt_tool", type: "tool", id: "call_v2", tool: "read", state: { status: "error", input: { path: "a.txt" } } });
+  emit("step_finish", { id: "prt_f", type: "step-finish", reason: "tool-calls", tokens: { total: 7, input: 4, output: 3, reasoning: 0, cache: { read: 0, write: 0 } } });
+});`,
       async () => {
-        const message = await streamOpenCode(model, fakeContext(), { reasoning: "low" }).result();
-        assert.equal(message.stopReason, "stop");
+        const seen: AssistantMessageEvent[] = [];
+        for await (const event of streamOpenCode(model, context, { reasoning: "low" })) seen.push(event);
+        return seen;
       },
       "opencode v2.0.16",
     );
+
+    const done = events.at(-1);
+    if (done?.type !== "done") return assert.fail(`expected done, got ${JSON.stringify(done)}`);
+    assert.equal(done.reason, "toolUse");
+    assert.deepEqual(done.message.content, [
+      { type: "thinking", thinking: "Plan." },
+      { type: "text", text: "Reading it." },
+      { type: "toolCall", id: "call_v2", name: "read", arguments: { path: "a.txt" } },
+    ]);
+    assert.equal(done.message.usage.totalTokens, 7);
     const invocation = JSON.parse(readFileSync(capturePath, "utf8")) as {
       args: string[];
+      stdin: string;
       cwd: string;
+      imageHex: string;
       agent: string;
     };
-    assert.deepEqual(invocation.args, [
+    assert.deepEqual(invocation.args.slice(0, -2), [
       "run", "--standalone", "-m", "opencode/fake-free#low",
       "--agent", "pi-model", "--format", "json", "--thinking",
     ]);
+    assert.equal(invocation.args.at(-2), "--file");
+    assert.equal(invocation.imageHex, Buffer.from("image bytes").toString("hex"));
+    assert.match(invocation.stdin, /Conversation transcript/);
     assert.match(invocation.agent, /mode: primary/);
-    assert.match(invocation.agent, /\n  "read": allow\n/);
     assert.match(invocation.cwd, /opencode-pi-/);
   } finally {
     rmSync(captureDir, { recursive: true, force: true });
   }
 });
 
-test("streamOpenCode leaves v2 model ID unsuffixed without a selected variant", async () => {
-  await withFakeOpenCode(
-    `const args = process.argv.slice(2);
-if (args[args.indexOf("-m") + 1] !== "opencode/fake-free") process.exit(1);
-process.stdout.write(JSON.stringify({ type: "text", part: { text: "ok" } }) + "\\n");`,
-    async () => {
-      const message = await streamOpenCode(fakeModel(), fakeContext()).result();
-      assert.equal(message.stopReason, "stop");
-    },
-    "v2.0.16",
+test("streamOpenCode reports OpenCode v2 run failures", async () => {
+  const message = await withFakeOpenCode(
+    `if (process.argv[2] === "session") process.exit(0);
+process.stdin.resume();
+process.stdin.on("end", () => {
+  process.stdout.write(JSON.stringify({ type: "error", sessionID: "ses-v2", error: { message: "model not found" } }) + "\\n");
+  process.exit(1);
+});`,
+    () => streamOpenCode(fakeModel(), fakeContext()).result(),
+    "opencode v2.0.16",
   );
+  assert.equal(message.stopReason, "error");
+  assert.equal(message.errorMessage, "model not found");
 });
 
-test("streamOpenCode refuses unknown CLI versions rather than guessing v1 flags", async () => {
+test("streamOpenCode refuses unknown CLI versions rather than guessing", async () => {
   const message = await withFakeOpenCode(
-    `process.exit(1);`,
+    fakeServer(),
     () => streamOpenCode(fakeModel(), fakeContext()).result(),
     "not a version",
   );
   assert.equal(message.stopReason, "error");
   assert.match(message.errorMessage ?? "", /Cannot determine OpenCode CLI version/);
+});
+
+test("streamOpenCode reports a server that fails to start", async () => {
+  const message = await withFakeOpenCode(
+    `if (process.argv[2] === "serve") { console.error("port in use"); process.exit(3); }`,
+    () => streamOpenCode(fakeModel(), fakeContext()).result(),
+  );
+  assert.equal(message.stopReason, "error");
+  assert.match(message.errorMessage ?? "", /opencode serve exited with code 3 before it was ready: port in use/);
 });
 
 test("streamOpenCode rejects unsupported image types before provider execution", async () => {
@@ -1505,50 +1730,6 @@ process.stdout.write(["opencode/big-pickle", "opencode/space-bunny-free", "openc
   }
 });
 
-test("plain-list discovery selects run flags from the installed CLI version", async () => {
-  const previousModels = process.env.OPENCODE_PI_MODELS;
-  delete process.env.OPENCODE_PI_MODELS;
-  try {
-    for (const [version, expected] of [
-      ["opencode v2.0.16", ["run", "--standalone", "-m", "opencode/space-bunny-free#low", "--agent", "pi-model", "--format", "json", "--thinking"]],
-      ["opencode v1.2.0", ["run", "--pure", "-m", "opencode/space-bunny-free", "--agent", "pi-model", "--format", "json", "--dir"]],
-    ] as const) {
-      await withFakeOpenCode(
-        `const args = process.argv.slice(2);
-if (args[0] === "api" || args.includes("--verbose")) process.exit(1);
-if (args[0] === "models") { process.stdout.write("opencode/space-bunny-free\\n"); process.exit(0); }
-if (args[0] === "run") {
-  process.stdout.write(JSON.stringify({ type: "text", part: { text: JSON.stringify(args) } }) + "\\n");
-  process.exit(0);
-}
-process.exit(1);`,
-        async () => {
-          const { models, error } = await discoverModels();
-          assert.equal(error, undefined);
-          const message = await streamOpenCode(
-            { ...fakeModel(), id: models[0]!.id, thinkingLevelMap: { low: "low" } },
-            fakeContext(),
-            { reasoning: "low" },
-          ).result();
-          assert.equal(message.stopReason, "stop");
-          const args = JSON.parse((message.content[0] as { text: string }).text) as string[];
-          assert.deepEqual(args.slice(0, expected.length), expected);
-          if (version.includes("v2")) {
-            assert.equal(args.includes("--dir"), false);
-            assert.equal(args.includes("--variant"), false);
-            assert.equal(args.includes("--pure"), false);
-          } else {
-            assert.deepEqual(args.slice(-3), ["--thinking", "--variant", "low"]);
-          }
-        },
-        version,
-      );
-    }
-  } finally {
-    restoreEnv("OPENCODE_PI_MODELS", previousModels);
-  }
-});
-
 test("resolveTurnTimeoutMs honors Pi timeouts and bounds unbounded turns", () => {
   assert.equal(resolveTurnTimeoutMs(30), 30);
   assert.equal(resolveTurnTimeoutMs(600_000), 600_000);
@@ -1559,45 +1740,37 @@ test("resolveTurnTimeoutMs honors Pi timeouts and bounds unbounded turns", () =>
   assert.equal(resolveTurnTimeoutMs(Number.POSITIVE_INFINITY), 180_000);
 });
 
-test("streamOpenCode detaches the abort listener on the error path", async () => {
-  let added = 0;
-  let removed = 0;
+function countingSignal(): { signal: AbortSignal; counts: { added: number; removed: number } } {
+  const counts = { added: 0, removed: 0 };
   const signal = {
     aborted: false,
     addEventListener() {
-      added += 1;
+      counts.added += 1;
     },
     removeEventListener() {
-      removed += 1;
+      counts.removed += 1;
     },
   } as unknown as AbortSignal;
+  return { signal, counts };
+}
 
+test("streamOpenCode detaches the abort listener on the error path", async () => {
+  const { signal, counts } = countingSignal();
   const message = await withFakeOpenCode(
-    fakeEventScript([{ type: "error", error: { data: { message: "boom" } } }]),
+    fakeServer({ events: [sessionError("boom")] }),
     () =>
       streamOpenCode(fakeModel(), fakeContext(["read"]), { signal }).result(),
   );
 
   assert.equal(message.stopReason, "error");
-  assert.equal(added, 1);
-  assert.equal(removed, 1);
+  assert.equal(message.errorMessage, "boom");
+  assert.deepEqual(counts, { added: 1, removed: 1 });
 });
 
 test("streamOpenCode detaches the abort listener on the timeout path", async () => {
-  let added = 0;
-  let removed = 0;
-  const signal = {
-    aborted: false,
-    addEventListener() {
-      added += 1;
-    },
-    removeEventListener() {
-      removed += 1;
-    },
-  } as unknown as AbortSignal;
-
+  const { signal, counts } = countingSignal();
   const message = await withFakeOpenCode(
-    "setInterval(() => undefined, 1_000);",
+    fakeServer({ events: [], idle: false }),
     () =>
       streamOpenCode(fakeModel(), fakeContext(), {
         signal,
@@ -1606,38 +1779,8 @@ test("streamOpenCode detaches the abort listener on the timeout path", async () 
   );
 
   assert.equal(message.stopReason, "error");
-  assert.equal(added, 1);
-  assert.equal(removed, 1);
+  assert.deepEqual(counts, { added: 1, removed: 1 });
 });
-
-// A fake `opencode` binary that records every invocation (args + stdin) and
-// answers turns with a fixed session ID, so session-reuse tests can assert
-// continuation args, delta-only prompts, and directory stability. The
-// fire-and-forget `session delete` helper hits the same binary and must not
-// pollute the capture log.
-function sessionFakeScript(capturePath: string, sessionId: string): string {
-  return `const fs = require("node:fs");
-if (process.argv.includes("session")) process.exit(0);
-let body = "";
-process.stdin.on("data", (chunk) => { body += chunk; });
-process.stdin.on("end", () => {
-  const args = process.argv.slice(2);
-  const dir = args.includes("--dir") ? args[args.indexOf("--dir") + 1] : process.cwd();
-  const tools = fs.readdirSync(require("node:path").join(dir, ".opencode", "tools")).sort();
-  fs.appendFileSync(${JSON.stringify(capturePath)}, JSON.stringify({ args, stdin: body, tools }) + "\\n");
-  process.stdout.write(JSON.stringify({ type: "text", part: { text: "hello" }, sessionID: ${JSON.stringify(sessionId)} }) + "\\n");
-  process.stdout.write(JSON.stringify({ type: "step_finish", part: { reason: "stop", tokens: { total: 10, input: 5, output: 5, reasoning: 0, cache: { read: 0, write: 0 } } }, sessionID: ${JSON.stringify(sessionId)} }) + "\\n");
-});
-`;
-}
-
-function readInvocations(capturePath: string): { args: string[]; stdin: string; tools?: string[] }[] {
-  if (!existsSync(capturePath)) return [];
-  return readFileSync(capturePath, "utf8")
-    .split("\n")
-    .filter(Boolean)
-    .map((line) => JSON.parse(line));
-}
 
 function userContext(texts: string[], toolNames: string[] = []): Context {
   return {
@@ -1670,7 +1813,7 @@ function conversationContext(): Context {
 
 test("streamOpenCode replays Pi system messages into the prompt and tools", async () => {
   const captureDir = mkdtempSync(join(tmpdir(), "opencode-pi-capture-"));
-  const capturePath = join(captureDir, "invocations.jsonl");
+  const capturePath = join(captureDir, "requests.jsonl");
   // Pi 1.3 hands providers the prompt and tools as transcript system messages.
   const context = normalizeContext({
     systemPrompt: "BASE PROMPT",
@@ -1683,18 +1826,18 @@ test("streamOpenCode replays Pi system messages into the prompt and tools", asyn
   });
   try {
     const message = await withFakeOpenCode(
-      sessionFakeScript(capturePath, "ses-system-1"),
+      fakeServer({ capturePath, sessionId: "ses-system-1" }),
       () => streamOpenCode(fakeModel(), context).result(),
     );
     assert.equal(message.stopReason, "stop");
     const invocation = readInvocations(capturePath)[0];
-    const stdin = invocation?.stdin ?? "";
-    assert.match(stdin, /BASE PROMPT/);
-    assert.match(stdin, /LATER INSTRUCTION/);
+    const text = invocation?.text ?? "";
+    assert.match(text, /BASE PROMPT/);
+    assert.match(text, /LATER INSTRUCTION/);
     assert.ok(invocation?.tools?.includes("read.js"));
     assert.ok(invocation?.tools?.includes("bash.js"));
-    assert.match(stdin, /USER:\nfirst question[\s\S]*USER:\nsecond question/);
-    assert.equal(stdin.includes("SYSTEM:"), false);
+    assert.match(text, /USER:\nfirst question[\s\S]*USER:\nsecond question/);
+    assert.equal(text.includes("SYSTEM:"), false);
   } finally {
     rmSync(captureDir, { recursive: true, force: true });
   }
@@ -1702,11 +1845,11 @@ test("streamOpenCode replays Pi system messages into the prompt and tools", asyn
 
 test("streamOpenCode reuses the session and sends only the transcript delta", async () => {
   const captureDir = mkdtempSync(join(tmpdir(), "opencode-pi-capture-"));
-  const capturePath = join(captureDir, "invocations.jsonl");
+  const capturePath = join(captureDir, "requests.jsonl");
   const piSessionId = `pi-reuse-${Date.now()}`;
   try {
     const first = await withFakeOpenCode(
-      sessionFakeScript(capturePath, "ses-reuse-1"),
+      fakeServer({ capturePath, sessionId: "ses-reuse-1" }),
       () =>
         streamOpenCode(fakeModel(), userContext(["first question"]), {
           sessionId: piSessionId,
@@ -1715,7 +1858,7 @@ test("streamOpenCode reuses the session and sends only the transcript delta", as
     assert.equal(first.stopReason, "stop");
 
     const second = await withFakeOpenCode(
-      sessionFakeScript(capturePath, "ses-reuse-1"),
+      fakeServer({ capturePath, sessionId: "ses-unused" }),
       () =>
         streamOpenCode(fakeModel(), conversationContext(), {
           sessionId: piSessionId,
@@ -1726,21 +1869,16 @@ test("streamOpenCode reuses the session and sends only the transcript delta", as
     const invocations = readInvocations(capturePath);
     assert.equal(invocations.length, 2);
     // First turn starts a fresh session with the full transcript.
-    assert.equal(invocations[0]?.args.includes("--session"), false);
-    assert.match(invocations[0]?.stdin ?? "", /first question/);
-    // Continuation passes --session, reuses the directory, and sends the delta.
-    const sessionIndex = invocations[1]?.args.indexOf("--session") ?? -1;
-    assert.notEqual(sessionIndex, -1);
-    assert.equal(invocations[1]?.args[sessionIndex + 1], "ses-reuse-1");
-    assert.match(invocations[1]?.stdin ?? "", /second question/);
-    assert.equal((invocations[1]?.stdin ?? "").includes("first question"), false);
+    assert.equal(invocations[0]?.continued, false);
+    assert.match(invocations[0]?.text ?? "", /first question/);
+    // Continuation reuses the session and directory and sends the delta.
+    assert.equal(invocations[1]?.continued, true);
+    assert.equal(invocations[1]?.sessionID, "ses-reuse-1");
+    assert.match(invocations[1]?.text ?? "", /second question/);
+    assert.equal((invocations[1]?.text ?? "").includes("first question"), false);
     // The previous reply is already in the OpenCode session.
-    assert.equal((invocations[1]?.stdin ?? "").includes("hello"), false);
-    const dirIndex = (args: string[]) => args.indexOf("--dir");
-    assert.equal(
-      invocations[1]?.args[dirIndex(invocations[1]?.args ?? []) + 1],
-      invocations[0]?.args[dirIndex(invocations[0]?.args ?? []) + 1],
-    );
+    assert.equal((invocations[1]?.text ?? "").includes("hello"), false);
+    assert.equal(invocations[1]?.directory, invocations[0]?.directory);
     assert.equal(trackedPiSessionCount() >= 1, true);
   } finally {
     await cleanupPiSessionState(piSessionId);
@@ -1750,11 +1888,11 @@ test("streamOpenCode reuses the session and sends only the transcript delta", as
 
 test("streamOpenCode starts fresh after an error drops the session", async () => {
   const captureDir = mkdtempSync(join(tmpdir(), "opencode-pi-capture-"));
-  const capturePath = join(captureDir, "invocations.jsonl");
+  const capturePath = join(captureDir, "requests.jsonl");
   const piSessionId = `pi-drop-${Date.now()}`;
   try {
     const first = await withFakeOpenCode(
-      sessionFakeScript(capturePath, "ses-drop-1"),
+      fakeServer({ capturePath, sessionId: "ses-drop-1" }),
       () =>
         streamOpenCode(fakeModel(), userContext(["first question"]), {
           sessionId: piSessionId,
@@ -1762,17 +1900,9 @@ test("streamOpenCode starts fresh after an error drops the session", async () =>
     );
     assert.equal(first.stopReason, "stop");
 
-    // A failed turn (OpenCode error event) drops the recorded session.
+    // A failed turn (OpenCode session error) drops the recorded session.
     const failed = await withFakeOpenCode(
-      `const fs = require("node:fs");
-if (process.argv.includes("session")) process.exit(0);
-let body = "";
-process.stdin.on("data", (chunk) => { body += chunk; });
-process.stdin.on("end", () => {
-  fs.appendFileSync(${JSON.stringify(capturePath)}, JSON.stringify({ args: process.argv.slice(2), stdin: body }) + "\\n");
-  process.stdout.write(JSON.stringify({ type: "error", sessionID: "ses-drop-1", error: { data: { message: "boom" } } }) + "\\n");
-});
-`,
+      fakeServer({ capturePath, events: [sessionError("boom")] }),
       () =>
         streamOpenCode(fakeModel(), userContext(["boom"]), {
           sessionId: piSessionId,
@@ -1781,7 +1911,7 @@ process.stdin.on("end", () => {
     assert.equal(failed.stopReason, "error");
 
     const recovered = await withFakeOpenCode(
-      sessionFakeScript(capturePath, "ses-drop-2"),
+      fakeServer({ capturePath, sessionId: "ses-drop-2" }),
       () =>
         streamOpenCode(fakeModel(), userContext(["third question"]), {
           sessionId: piSessionId,
@@ -1792,45 +1922,47 @@ process.stdin.on("end", () => {
     const invocations = readInvocations(capturePath);
     assert.equal(invocations.length, 3);
     // The recovery turn starts a fresh full-transcript session.
-    assert.equal(invocations[2]?.args.includes("--session"), false);
-    assert.match(invocations[2]?.stdin ?? "", /Conversation transcript/);
+    assert.equal(invocations[2]?.continued, false);
+    assert.equal(invocations[2]?.sessionID, "ses-drop-2");
+    assert.match(invocations[2]?.text ?? "", /Conversation transcript/);
   } finally {
     await cleanupPiSessionState(piSessionId);
     rmSync(captureDir, { recursive: true, force: true });
   }
 });
 
-test("streamOpenCode restarts the session when tools change", async () => {
+test("streamOpenCode restarts the session and reloads the config when tools change", async () => {
   const captureDir = mkdtempSync(join(tmpdir(), "opencode-pi-capture-"));
-  const capturePath = join(captureDir, "invocations.jsonl");
+  const capturePath = join(captureDir, "requests.jsonl");
   const piSessionId = `pi-tools-${Date.now()}`;
   try {
     const first = await withFakeOpenCode(
-      sessionFakeScript(capturePath, "ses-tools-1"),
-      () =>
-        streamOpenCode(fakeModel(), userContext(["q1"], ["read"]), {
+      fakeServer({ capturePath, sessionId: "ses-tools-1" }),
+      async () => {
+        const message = await streamOpenCode(fakeModel(), userContext(["q1"], ["read"]), {
           sessionId: piSessionId,
-        }).result(),
+        }).result();
+        assert.equal(message.stopReason, "stop");
+        // Same server, new tool list: the stale instance must be reloaded.
+        return streamOpenCode(fakeModel(), userContext(["q1", "q2"], ["read", "bash"]), {
+          sessionId: piSessionId,
+        }).result();
+      },
     );
     assert.equal(first.stopReason, "stop");
 
-    const second = await withFakeOpenCode(
-      sessionFakeScript(capturePath, "ses-tools-2"),
-      () =>
-        streamOpenCode(fakeModel(), userContext(["q1", "q2"], ["read", "bash"]), {
-          sessionId: piSessionId,
-        }).result(),
-    );
-    assert.equal(second.stopReason, "stop");
-
+    const requests = readCaptured(capturePath);
     const invocations = readInvocations(capturePath);
     assert.equal(invocations.length, 2);
     // A changed tool list restarts with the full transcript, not a delta.
-    assert.equal(invocations[1]?.args.includes("--session"), false);
+    assert.notEqual(invocations[1]?.sessionID, undefined);
+    assert.match(invocations[1]?.text ?? "", /Conversation transcript[\s\S]*q1/);
     assert.ok(invocations[0]?.tools?.includes("read.js"));
     assert.equal(invocations[0]?.tools?.includes("bash.js"), false);
     assert.ok(invocations[1]?.tools?.includes("bash.js"));
-    assert.match(invocations[1]?.stdin ?? "", /q1/);
+    const dispose = requests.findIndex((entry) => entry.path === "/instance/dispose");
+    const prompts = requests.flatMap((entry, index) => (entry.path.endsWith("/prompt_async") ? [index] : []));
+    assert.ok(prompts[0]! < dispose && dispose < prompts[1]!);
   } finally {
     await cleanupPiSessionState(piSessionId);
     rmSync(captureDir, { recursive: true, force: true });
@@ -1839,28 +1971,25 @@ test("streamOpenCode restarts the session when tools change", async () => {
 
 test("streamOpenCode runs isolated fresh sessions without a Pi session ID", async () => {
   const captureDir = mkdtempSync(join(tmpdir(), "opencode-pi-capture-"));
-  const capturePath = join(captureDir, "invocations.jsonl");
+  const capturePath = join(captureDir, "requests.jsonl");
   try {
-    for (const question of ["q1", "q2"]) {
-      const message = await withFakeOpenCode(
-        sessionFakeScript(capturePath, "ses-once"),
-        () => streamOpenCode(fakeModel(), userContext([question])).result(),
-      );
-      assert.equal(message.stopReason, "stop");
-    }
+    await withFakeOpenCode(fakeServer({ capturePath, sessionId: "ses-once" }), async () => {
+      for (const question of ["q1", "q2"]) {
+        const message = await streamOpenCode(fakeModel(), userContext([question])).result();
+        assert.equal(message.stopReason, "stop");
+      }
+    });
+    const requests = readCaptured(capturePath);
     const invocations = readInvocations(capturePath);
     assert.equal(invocations.length, 2);
     for (const invocation of invocations) {
-      assert.equal(invocation.args.includes("--session"), false);
-      assert.match(invocation.stdin, /Conversation transcript/);
+      assert.equal(invocation.continued, false);
+      assert.match(invocation.text ?? "", /Conversation transcript/);
+      // Each one-shot directory is unloaded and deleted after its turn.
+      assert.ok(requests.some((entry) => entry.path === "/instance/dispose" && entry.directory === invocation.directory));
+      assert.equal(existsSync(invocation.directory), false);
     }
-    assert.notEqual(
-      invocationDir(invocations[0]),
-      invocationDir(invocations[1]),
-    );
-    function invocationDir(invocation: { args: string[] }): string {
-      return invocation.args[invocation.args.indexOf("--dir") + 1] ?? "";
-    }
+    assert.notEqual(invocations[0]?.directory, invocations[1]?.directory);
   } finally {
     rmSync(captureDir, { recursive: true, force: true });
   }
@@ -1877,7 +2006,7 @@ test("cleanupPiSessionState removes the project directory at teardown", async ()
   let before = 0;
   try {
     await withFakeOpenCode(
-      sessionFakeScript(capturePath, "ses-teardown-1"),
+      fakeServer({ capturePath, sessionId: "ses-teardown-1" }),
       () =>
         streamOpenCode(fakeModel(), userContext(["hello"]), {
           sessionId: piSessionId,
@@ -1885,8 +2014,7 @@ test("cleanupPiSessionState removes the project directory at teardown", async ()
     );
     before = trackedPiSessionCount();
     assert.equal(before >= 1, true);
-    const invocations = readInvocations(capturePath);
-    const dir = invocations[0]?.args[invocations[0]?.args.indexOf("--dir") + 1];
+    const dir = readInvocations(capturePath)[0]?.directory ?? "";
     assert.equal(existsSync(dir), true);
 
     await cleanupPiSessionState(piSessionId);

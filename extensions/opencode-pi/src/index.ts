@@ -26,6 +26,13 @@ import {
   type ToolCall,
 } from "@earendil-works/pi-ai";
 import { registerApiProvider } from "@earendil-works/pi-ai/compat";
+import {
+  runningOpenCodeServer,
+  serverRequest,
+  subscribeEvents,
+  withOpenCodeServer,
+  type ServerEvent,
+} from "./server.js";
 
 type TranscriptMessage = Exclude<Message, SystemMessage>;
 
@@ -378,20 +385,6 @@ function thinkingLevelMap(variants: unknown): ThinkingLevelMap {
   }
   if (!names.has("xhigh") && names.has("max")) map.xhigh = "max";
   return map;
-}
-
-export function reasoningCliArgs(
-  requestedReasoning: ModelThinkingLevel | undefined,
-  map?: ThinkingLevelMap,
-): string[] {
-  if (!requestedReasoning || requestedReasoning === "off") return [];
-
-  const args = ["--thinking"];
-  const variant = map?.[requestedReasoning];
-  if (typeof variant === "string" && variant.trim()) {
-    args.push("--variant", variant);
-  }
-  return args;
 }
 
 function findJsonObjectEnd(text: string, start: number): number | undefined {
@@ -826,37 +819,30 @@ function safeImageExtension(mimeType: string): string {
   return extensions[mimeType.toLowerCase()] ?? ".bin";
 }
 
-async function writeImageFiles(
-  images: ImageContent[],
-  directory: string,
-): Promise<string[]> {
-  const imageDir = join(directory, "pi-images");
-  if (images.length > 0) await mkdir(imageDir, { recursive: true });
-  return Promise.all(
-    images.map(async (image, index) => {
-      if (!image.mimeType.toLowerCase().startsWith("image/")) {
-        throw new Error(`Unsupported image MIME type: ${image.mimeType}`);
-      }
-      const base64 = image.data.replace(/\s/g, "");
-      if (
-        !base64 ||
-        base64.length % 4 === 1 ||
-        !/^[A-Za-z0-9+/]*={0,2}$/.test(base64)
-      ) {
-        throw new Error(`Invalid base64 data for image ${index + 1}`);
-      }
-      const data = Buffer.from(base64, "base64");
-      if (data.length === 0) {
-        throw new Error(`Empty image data for image ${index + 1}`);
-      }
-      const path = join(
-        imageDir,
-        `image-${String(index + 1).padStart(3, "0")}${safeImageExtension(image.mimeType)}`,
-      );
-      await writeFile(path, data);
-      return path;
-    }),
-  );
+/** Validate Pi images and turn them into OpenCode file parts. */
+function imageFileParts(images: ImageContent[]) {
+  return images.map((image, index) => {
+    if (!image.mimeType.toLowerCase().startsWith("image/")) {
+      throw new Error(`Unsupported image MIME type: ${image.mimeType}`);
+    }
+    const base64 = image.data.replace(/\s/g, "");
+    if (
+      !base64 ||
+      base64.length % 4 === 1 ||
+      !/^[A-Za-z0-9+/]*={0,2}$/.test(base64)
+    ) {
+      throw new Error(`Invalid base64 data for image ${index + 1}`);
+    }
+    if (Buffer.from(base64, "base64").length === 0) {
+      throw new Error(`Empty image data for image ${index + 1}`);
+    }
+    return {
+      type: "file" as const,
+      mime: image.mimeType,
+      filename: `image-${String(index + 1).padStart(3, "0")}${safeImageExtension(image.mimeType)}`,
+      url: `data:${image.mimeType};base64,${base64}`,
+    };
+  });
 }
 
 function safeJson(value: unknown): string {
@@ -1022,7 +1008,7 @@ export async function cleanupPiSessionState(
         const dirPromise = state.dirPromise;
         state.dirPromise = undefined;
         const dir = await dirPromise.catch(() => undefined);
-        if (dir) await rm(dir, { recursive: true, force: true }).catch(() => undefined);
+        if (dir) await releaseDirectory(dir);
       }
     }),
   );
@@ -1083,9 +1069,9 @@ function buildContinuationPrompt(deltaParts: string[]): string {
 // OpenCode's free tier answers 403 unless the request declares a tool named
 // `read`, so the bridge always declares one.
 const REQUIRED_TOOL = "read";
-// Custom tools ask for this permission, which `opencode run` auto-rejects.
-// The rejection ends OpenCode's step without running anything, and the
-// tool_use event hands the call to Pi.
+// Custom tools ask for this permission, which the bridge rejects. The
+// rejection ends OpenCode's step without running anything, and the finished
+// tool part hands the call to Pi.
 const PI_TOOL_PERMISSION = "pi_tool";
 const TOOL_NAME_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 // OpenCode gates these built-in tool IDs behind the first ID's permission.
@@ -1220,6 +1206,32 @@ function createTempAgentDir(): Promise<string> {
   return mkdtemp(join(tmpdir(), "opencode-pi-"));
 }
 
+// Serialized tool list last written to each project directory.
+const configuredDirs = new Map<string, string>();
+
+/**
+ * Write the bridge config when the tool list changed. Returns true when the
+ * server may still hold the directory's old config.
+ */
+async function syncBridgeConfig(dir: string, tools: Tool[]): Promise<boolean> {
+  const key = serializeTools(tools);
+  const previous = configuredDirs.get(dir);
+  if (previous === key) return false;
+  await writeBridgeConfig(dir, tools);
+  configuredDirs.set(dir, key);
+  return previous !== undefined;
+}
+
+/** Unload a project directory from the server and delete it. */
+async function releaseDirectory(dir: string): Promise<void> {
+  configuredDirs.delete(dir);
+  const server = runningOpenCodeServer();
+  if (server) {
+    await serverRequest(server, "POST", "/instance/dispose", dir).catch(() => undefined);
+  }
+  await rm(dir, { recursive: true, force: true }).catch(() => undefined);
+}
+
 /**
  * Pi passes the prompt and tools as system messages in the transcript. Replay
  * them into the current prompt and tool list, and keep the rest as the
@@ -1257,16 +1269,20 @@ export function streamOpenCode(
     };
 
     let tempDir: string | undefined;
-    let accumulatedText = "";
-    let accumulatedThinking = "";
-    let stderr = "";
-    let stdoutRemainder = "";
-    let capturedSessionId: string | undefined;
-    const toolCalls: ToolCall[] = [];
-    let opencodeError: string | undefined;
+    // Only one-shot turns own their directory. Per-Pi-session directories
+    // persist for reuse and are removed at session teardown (#74). Release
+    // it before the final event so the turn is fully done when Pi sees it.
+    const releaseTempDir = async () => {
+      const dir = tempDir;
+      tempDir = undefined;
+      if (dir) await releaseDirectory(dir);
+    };
+    let sessionId: string | undefined;
     let finishReason: "stop" | "length" = "stop";
-    let timedOut = false;
-    let timer: ReturnType<typeof setTimeout> | undefined;
+    let opencodeError: string | undefined;
+    let visibleText = "";
+    let thinkingText = "";
+    const toolCalls: ToolCall[] = [];
     // Per-Pi-session reuse key supplied by Pi core (stable for the life of
     // the Pi session). Without it, every turn runs an isolated fresh
     // session in its own temporary directory.
@@ -1277,6 +1293,142 @@ export function streamOpenCode(
     const piState = piSessionId ? getPiSessionState(piSessionId) : undefined;
     const transcriptParts = serializedTranscriptParts(context.messages);
 
+    // One controller covers Pi's abort and the unconditional turn timeout
+    // (#73). The abort listener is detached on every exit path (#72).
+    const controller = new AbortController();
+    const turnTimeoutMs = resolveTurnTimeoutMs(options?.timeoutMs);
+    let timedOut = false;
+    const abort = () => controller.abort();
+    options?.signal?.addEventListener("abort", abort, { once: true });
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, turnTimeoutMs);
+
+    // Text and reasoning stream as they arrive. Each OpenCode part becomes
+    // one Pi content block, closed before the next block starts.
+    const partTypes = new Map<string, string>();
+    const partText = new Map<string, string>();
+    const seenCalls = new Set<string>();
+    let open: { partId: string; index: number } | undefined;
+
+    const closeOpen = () => {
+      if (!open) return;
+      const contentIndex = open.index;
+      const block = output.content[contentIndex];
+      open = undefined;
+      if (block?.type === "text") {
+        stream.push({ type: "text_end", contentIndex, content: block.text, partial: output });
+      } else if (block?.type === "thinking") {
+        stream.push({ type: "thinking_end", contentIndex, content: block.thinking, partial: output });
+      }
+    };
+
+    const appendDelta = (partId: string, kind: "text" | "thinking", delta: string) => {
+      if (!delta) return;
+      partText.set(partId, (partText.get(partId) ?? "") + delta);
+      if (open?.partId !== partId) {
+        closeOpen();
+        open = { partId, index: output.content.length };
+        output.content.push(kind === "text" ? { type: "text", text: "" } : { type: "thinking", thinking: "" });
+        stream.push({ type: kind === "text" ? "text_start" : "thinking_start", contentIndex: open.index, partial: output });
+      }
+      const contentIndex = open.index;
+      const block = output.content[contentIndex];
+      if (block?.type === "text") {
+        block.text += delta;
+        visibleText += delta;
+        stream.push({ type: "text_delta", contentIndex, delta, partial: output });
+      } else if (block?.type === "thinking") {
+        block.thinking += delta;
+        thinkingText += delta;
+        stream.push({ type: "thinking_delta", contentIndex, delta, partial: output });
+      }
+    };
+
+    const blockKind = (type: string | undefined) =>
+      type === "text" ? "text" : type === "reasoning" ? "thinking" : undefined;
+
+    /** Handle one server event; returns true when the turn is finished. */
+    const handleEvent = async (
+      event: ServerEvent,
+      reply: (path: string, body: unknown) => Promise<unknown>,
+    ): Promise<boolean> => {
+      const props = event.properties ?? {};
+
+      if (event.type === "message.part.delta") {
+        if (props.sessionID !== sessionId || props.field !== "text") return false;
+        const kind = blockKind(partTypes.get(props.partID));
+        if (kind && typeof props.delta === "string") appendDelta(props.partID, kind, props.delta);
+        return false;
+      }
+
+      if (event.type === "message.part.updated") {
+        const part = props.part;
+        if (!part || part.sessionID !== sessionId) return false;
+        partTypes.set(part.id, part.type);
+        const kind = blockKind(part.type);
+        if (kind && part.time?.end && typeof part.text === "string") {
+          // The finished part carries its full text; emit anything the
+          // deltas missed, then close its block.
+          const seen = partText.get(part.id) ?? "";
+          if (part.text.startsWith(seen)) appendDelta(part.id, kind, part.text.slice(seen.length));
+          if (open?.partId === part.id) closeOpen();
+          return false;
+        }
+        if (part.type === "step-finish") {
+          if (/length|max.?tokens/i.test(String(part.reason ?? ""))) finishReason = "length";
+          const tokens = part.tokens;
+          if (!tokens) return false;
+          output.usage.input = Number(tokens.input ?? 0);
+          output.usage.output = Number(tokens.output ?? 0) + Number(tokens.reasoning ?? 0);
+          output.usage.cacheRead = Number(tokens.cache?.read ?? 0);
+          output.usage.cacheWrite = Number(tokens.cache?.write ?? 0);
+          output.usage.totalTokens = Number(
+            tokens.total ??
+              output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite,
+          );
+          calculateCost(model, output.usage);
+          return false;
+        }
+        // A Pi tool ends OpenCode's step through the rejected pi_tool ask,
+        // so its finished tool part is a call for Pi to run. Calls to the
+        // unavailable stubs already got their message inside OpenCode.
+        if (part.type === "tool" && (part.state?.status === "completed" || part.state?.status === "error")) {
+          const tool = context.tools.find((candidate) => candidate.name === part.tool);
+          const id = typeof part.callID === "string" && part.callID ? part.callID : part.id;
+          if (!tool || seenCalls.has(id)) return false;
+          seenCalls.add(id);
+          closeOpen();
+          const toolCall: ToolCall = { type: "toolCall", id, name: tool.name, arguments: piArguments(tool, part.state.input) };
+          const contentIndex = output.content.length;
+          output.content.push(toolCall);
+          toolCalls.push(toolCall);
+          stream.push({ type: "toolcall_start", contentIndex, partial: output });
+          stream.push({ type: "toolcall_delta", contentIndex, delta: safeJson(toolCall.arguments), partial: output });
+          stream.push({ type: "toolcall_end", contentIndex, toolCall, partial: output });
+        }
+        return false;
+      }
+
+      if (event.type === "permission.asked" && props.sessionID === sessionId) {
+        await reply(`/permission/${props.id}/reply`, { reply: "reject" });
+        return false;
+      }
+
+      if (event.type === "session.error" && props.sessionID === sessionId) {
+        const message = props.error?.data?.message ?? props.error?.message ?? props.error?.name;
+        opencodeError = typeof message === "string" && message.trim() ? message.trim() : safeJson(props.error);
+        return false;
+      }
+
+      return (
+        event.type === "session.status" &&
+        props.sessionID === sessionId &&
+        props.status?.type === "idle"
+      );
+    };
+
     try {
       stream.push({ type: "start", partial: output });
       if (options?.signal?.aborted) throw new Error("Request was aborted");
@@ -1285,17 +1437,17 @@ export function streamOpenCode(
       // session only when the model, tools, system prompt, and transcript
       // prefix all still match. Any drift restarts fresh — and the stale
       // session record is deleted so it cannot leak.
-      let delta = piState
+      const delta = piState
         ? continuationDelta(piState, model.id, context, transcriptParts)
         : undefined;
       if (piState && piState.opencodeSessionId && delta === undefined) {
         dropOpencodeSession(piState);
       }
-      const isContinuation = delta !== undefined;
-      const prompt = isContinuation
+      const continuedSession = delta !== undefined ? piState?.opencodeSessionId : undefined;
+      const prompt = delta !== undefined
         ? buildContinuationPrompt(delta)
         : buildPrompt(context);
-      const sentMessages = isContinuation
+      const sentMessages = delta !== undefined
         ? context.messages.slice(transcriptParts.length - delta.length)
         : context.messages;
 
@@ -1305,304 +1457,180 @@ export function streamOpenCode(
             tempDir = dir;
             return dir;
           });
-      if (!isContinuation) await writeBridgeConfig(sessionDir, context.tools);
+      const staleInstance = await syncBridgeConfig(sessionDir, context.tools);
       if (options?.signal?.aborted) throw new Error("Request was aborted");
-      const images = imageContentsForModel(
-        sentMessages,
-        model.input.includes("image"),
+      const files = imageFileParts(
+        imageContentsForModel(sentMessages, model.input.includes("image")),
       );
-      const imagePaths = await writeImageFiles(images, sessionDir);
       if (options?.signal?.aborted) throw new Error("Request was aborted");
       const dialect = await cliDialect();
-      const requestedReasoning = options?.reasoning as
-        | ModelThinkingLevel
-        | undefined;
-      const variant = model.thinkingLevelMap?.[requestedReasoning ?? "off"];
-      const args = dialect === "v2"
-        ? [
-            "run",
-            "--standalone",
-            "-m",
-            typeof variant === "string" && variant.trim() && !model.id.includes("#")
-              ? `${model.id}#${variant}`
-              : model.id,
-            "--agent",
-            AGENT_ID,
-            "--format",
-            "json",
-          ]
-        : [
-            "run",
-            "--pure",
-            "-m",
-            model.id,
-            "--agent",
-            AGENT_ID,
-            "--format",
-            "json",
-            "--dir",
-            sessionDir,
-          ];
-      if (isContinuation && piState?.opencodeSessionId) {
-        args.push("--session", piState.opencodeSessionId);
-      }
-      if (dialect === "v1") {
-        args.push(
-          ...reasoningCliArgs(requestedReasoning, model.thinkingLevelMap),
-        );
-      } else if (requestedReasoning && requestedReasoning !== "off") {
-        args.push("--thinking");
-      }
-      for (const path of imagePaths) args.push("--file", path);
+      const reasoning = (options?.reasoning as ModelThinkingLevel | undefined) ?? "off";
+      const variant = model.thinkingLevelMap?.[reasoning];
+      const slash = model.id.indexOf("/");
+      const body = {
+        agent: AGENT_ID,
+        model: slash > 0
+          ? { providerID: model.id.slice(0, slash), modelID: model.id.slice(slash + 1) }
+          : { providerID: "opencode", modelID: model.id },
+        ...(typeof variant === "string" && variant.trim() ? { variant } : {}),
+        parts: [...files, { type: "text", text: prompt }],
+      };
 
-      const child = spawn(opencodeBin(), args, {
-        stdio: ["pipe", "pipe", "pipe"],
-        ...(dialect === "v2" ? { cwd: sessionDir } : {}),
-        env: { ...process.env, OPENCODE_DISABLE_UPDATE_CHECK: "1" },
-      });
+      const turnStopped = () =>
+        new Error(timedOut ? `opencode timed out after ${turnTimeoutMs}ms` : "Request was aborted");
 
-      const abort = () => child.kill("SIGTERM");
-      options?.signal?.addEventListener("abort", abort, { once: true });
-      // The timeout is unconditional: a turn is always bounded, even when
-      // Pi supplies no timeoutMs (#73).
-      const turnTimeoutMs = resolveTurnTimeoutMs(options?.timeoutMs);
-      timer = setTimeout(() => {
-        timedOut = true;
-        child.kill("SIGTERM");
-      }, turnTimeoutMs);
-
-      child.stdin!.end(prompt);
-      child.stdout!.setEncoding("utf8");
-      child.stderr!.setEncoding("utf8");
-
-      const handleLine = (line: string) => {
-        if (!line.trim()) return;
-        let event: any;
-        try {
-          event = JSON.parse(line);
-        } catch {
-          stderr = (stderr + `\n${line}`).slice(-STDERR_LIMIT);
-          return;
+      // OpenCode v2's server speaks a different API, so v2 turns still run
+      // through `opencode run`, which only reports finished parts.
+      const runStandalone = async () => {
+        const args = [
+          "run", "--standalone",
+          "-m", typeof variant === "string" && variant.trim() && !model.id.includes("#") ? `${model.id}#${variant}` : model.id,
+          "--agent", AGENT_ID, "--format", "json",
+        ];
+        if (continuedSession) args.push("--session", continuedSession);
+        if (reasoning !== "off") args.push("--thinking");
+        const imageDir = join(sessionDir, "pi-images");
+        if (files.length > 0) await mkdir(imageDir, { recursive: true });
+        for (const file of files) {
+          const path = join(imageDir, file.filename);
+          await writeFile(path, Buffer.from(file.url.slice(file.url.indexOf(",") + 1), "base64"));
+          args.push("--file", path);
         }
-
-        // Every JSON event carries the OpenCode session ID (#71).
-        if (typeof event.sessionID === "string" && event.sessionID) {
-          capturedSessionId = event.sessionID;
-        } else if (
-          typeof event.part?.sessionID === "string" &&
-          event.part.sessionID
-        ) {
-          capturedSessionId = event.part.sessionID;
-        }
-
-        if (event.type === "text" && typeof event.part?.text === "string") {
-          accumulatedText += event.part.text;
-          return;
-        }
-
-        if (
-          event.type === "reasoning" &&
-          typeof event.part?.text === "string"
-        ) {
-          accumulatedThinking += event.part.text;
-          return;
-        }
-
-        if (event.type === "step_finish") {
-          if (/length|max.?tokens/i.test(String(event.part?.reason ?? ""))) {
-            finishReason = "length";
+        const child = spawn(opencodeBin(), args, {
+          cwd: sessionDir,
+          stdio: ["pipe", "pipe", "pipe"],
+          env: { ...process.env, OPENCODE_DISABLE_UPDATE_CHECK: "1" },
+        });
+        const kill = () => child.kill("SIGTERM");
+        controller.signal.addEventListener("abort", kill, { once: true });
+        const partTypeByEvent: Record<string, string> = {
+          text: "text", reasoning: "reasoning", tool_use: "tool", step_finish: "step-finish",
+        };
+        let stderr = "";
+        let remainder = "";
+        let lineCount = 0;
+        const handleLine = (line: string) => {
+          if (!line.trim()) return;
+          let event: any;
+          try {
+            event = JSON.parse(line);
+          } catch {
+            stderr = (stderr + `\n${line}`).slice(-STDERR_LIMIT);
+            return;
           }
-          if (!event.part?.tokens) return;
-          const tokens = event.part.tokens;
-          output.usage.input = Number(tokens.input ?? 0);
-          output.usage.output =
-            Number(tokens.output ?? 0) + Number(tokens.reasoning ?? 0);
-          output.usage.cacheRead = Number(tokens.cache?.read ?? 0);
-          output.usage.cacheWrite = Number(tokens.cache?.write ?? 0);
-          output.usage.totalTokens = Number(
-            tokens.total ??
-              output.usage.input +
-                output.usage.output +
-                output.usage.cacheRead +
-                output.usage.cacheWrite,
-          );
-          calculateCost(model, output.usage);
-          return;
-        }
-
-        // Pi tools stop OpenCode's step through a rejected permission ask,
-        // so a Pi tool's tool_use event is a call for Pi to run. Calls to the
-        // unavailable stubs already returned their message inside OpenCode.
-        if (event.type === "tool_use") {
-          const name = String(event.part?.tool ?? "");
-          const tool = context.tools.find((candidate) => candidate.name === name);
-          if (!tool) return;
-          toolCalls.push({
-            type: "toolCall",
-            id:
-              typeof event.part?.callID === "string" && event.part.callID
-                ? event.part.callID
-                : `opencode_pi_${Date.now()}_${toolCalls.length}`,
-            name,
-            arguments: piArguments(tool, event.part?.state?.input),
-          });
-          return;
-        }
-
-        if (event.type === "error") {
-          const message =
-            event.error?.data?.message ??
-            event.error?.message ??
-            event.part?.message;
-          opencodeError =
-            typeof message === "string" && message.trim()
-              ? message.trim()
-              : safeJson(event);
-          stderr = (stderr + `\n${opencodeError}`).slice(-STDERR_LIMIT);
+          if (typeof event.sessionID === "string" && event.sessionID) sessionId ??= event.sessionID;
+          const type = partTypeByEvent[event.type];
+          if (type) {
+            // v2 tool parts carry the call ID as `id` and the part ID as `partID`.
+            const part = event.part ?? {};
+            void handleEvent({
+              type: "message.part.updated",
+              properties: {
+                part: {
+                  ...part,
+                  type,
+                  sessionID: sessionId,
+                  id: part.partID ?? part.id ?? `${event.type}-${lineCount++}`,
+                  callID: part.callID ?? part.id,
+                  time: { ...part.time, end: part.time?.end ?? Date.now() },
+                },
+              },
+            }, async () => undefined);
+          } else if (event.type === "error") {
+            void handleEvent({ type: "session.error", properties: { sessionID: sessionId, error: event.error } }, async () => undefined);
+          }
+        };
+        child.stdin!.end(prompt);
+        child.stdout!.setEncoding("utf8");
+        child.stderr!.setEncoding("utf8");
+        child.stdout!.on("data", (chunk: string) => {
+          const lines = (remainder + chunk).split(/\r?\n/);
+          remainder = lines.pop() ?? "";
+          for (const line of lines) handleLine(line);
+        });
+        child.stderr!.on("data", (chunk: string) => {
+          stderr = (stderr + chunk).slice(-STDERR_LIMIT);
+        });
+        const code = await new Promise<number | null>((resolve, reject) => {
+          child.on("error", reject);
+          child.on("close", resolve);
+        }).finally(() => controller.signal.removeEventListener("abort", kill));
+        handleLine(remainder);
+        if (controller.signal.aborted) throw turnStopped();
+        if (code !== 0 && !opencodeError) {
+          throw new Error(stderr.trim() || `opencode exited with code ${code}`);
         }
       };
 
-      child.stdout!.on("data", (chunk: string) => {
-        stdoutRemainder += chunk;
-        const lines = stdoutRemainder.split(/\r?\n/);
-        stdoutRemainder = lines.pop() ?? "";
-        for (const line of lines) handleLine(line);
-      });
-      child.stderr!.on("data", (chunk: string) => {
-        stderr = (stderr + chunk).slice(-STDERR_LIMIT);
-      });
+      if (dialect === "v2") await runStandalone();
+      else await withOpenCodeServer(
+        opencodeBin(),
+        { ...process.env, OPENCODE_DISABLE_UPDATE_CHECK: "1" },
+        async (server) => {
+          const request = (method: string, path: string, payload?: unknown) =>
+            serverRequest(server, method, path, sessionDir, payload, controller.signal);
+          try {
+            // A changed tool list rewrote the config; reload the instance.
+            if (staleInstance) await request("POST", "/instance/dispose");
+            const events = await subscribeEvents(server, sessionDir, controller.signal);
+            try {
+              sessionId = continuedSession ?? (await request("POST", "/session", {}))?.id;
+              if (typeof sessionId !== "string") throw new Error("OpenCode did not return a session ID");
+              await request("POST", `/session/${sessionId}/prompt_async`, body);
+              let finished = false;
+              for await (const event of events) {
+                if (await handleEvent(event, (path, payload) => request("POST", path, payload))) {
+                  finished = true;
+                  break;
+                }
+              }
+              if (!finished) throw new Error("OpenCode event stream ended before the turn finished");
+            } finally {
+              await events.return(undefined).catch(() => undefined);
+            }
+          } catch (error) {
+            if (!controller.signal.aborted) throw error;
+            if (sessionId) {
+              await serverRequest(server, "POST", `/session/${sessionId}/abort`, sessionDir).catch(() => undefined);
+            }
+            throw turnStopped();
+          }
+        },
+      );
+      closeOpen();
 
-      // The abort listener is detached on every exit path — success,
-      // error, and timeout alike (#72).
-      let code: number | null;
-      try {
-        code = await new Promise<number | null>((resolve, reject) => {
-          child.on("error", reject);
-          child.on("close", resolve);
-        });
-      } finally {
-        options?.signal?.removeEventListener("abort", abort);
-      }
-      if (timer) clearTimeout(timer);
-      if (stdoutRemainder.trim()) handleLine(stdoutRemainder);
-
-      if (options?.signal?.aborted) {
-        throw new Error("Request was aborted");
-      }
-      if (timedOut) {
-        throw new Error(`opencode timed out after ${turnTimeoutMs}ms`);
-      }
-      if (code !== 0) {
-        throw new Error(stderr.trim() || `opencode exited with code ${code}`);
-      }
       if (opencodeError) throw new Error(opencodeError);
-      if (
-        toolCalls.length === 0 &&
-        !accumulatedText.trim() &&
-        !accumulatedThinking.trim()
-      ) {
-        const stderrMsg = stderr.trim();
-        if (stderrMsg) {
-          throw new Error(
-            `OpenCode returned stderr: ${stderrMsg}`,
-          );
-        }
-        // The model may have emitted text events with empty strings, or
-        // may have produced reasoning-only output that was not captured
-        // as assistant text. Provide a clearer diagnostic.
-        const rawTextPreview = accumulatedText
-          ? `raw text length=${accumulatedText.length} (trimmed to "${accumulatedText.slice(0, 80).replace(/\n/g, " ")}")`
-          : "no text events received";
-        const rawThinkingPreview = accumulatedThinking
-          ? `thinking length=${accumulatedThinking.length}`
-          : "no thinking output";
+      if (toolCalls.length === 0 && !visibleText.trim() && !thinkingText.trim()) {
         throw new Error(
-          `OpenCode returned empty assistant response (${rawTextPreview}; ${rawThinkingPreview}). This can happen with some free models when the prompt is too long, the model times out, or the model is overloaded. Retry the request or select another OpenCode model.`,
+          `OpenCode returned an empty assistant response (${visibleText ? `whitespace-only text, length=${visibleText.length}` : "no text"}). This can happen with some free models when the prompt is too long, the model times out, or the model is overloaded. Retry the request or select another OpenCode model.`,
         );
       }
-      setEstimatedUsage(
-        model,
-        output,
-        prompt,
-        accumulatedText + accumulatedThinking,
-      );
-      if (accumulatedThinking) {
-        const thinkingIndex = output.content.length;
-        output.content.push({ type: "thinking", thinking: accumulatedThinking });
-        stream.push({
-          type: "thinking_start",
-          contentIndex: thinkingIndex,
-          partial: output,
-        });
-        stream.push({
-          type: "thinking_delta",
-          contentIndex: thinkingIndex,
-          delta: accumulatedThinking,
-          partial: output,
-        });
-        stream.push({
-          type: "thinking_end",
-          contentIndex: thinkingIndex,
-          content: accumulatedThinking,
-          partial: output,
-        });
-      }
-
-      if (accumulatedText.trim()) {
-        const contentIndex = output.content.length;
-        output.content.push({ type: "text", text: accumulatedText });
-        stream.push({ type: "text_start", contentIndex, partial: output });
-        stream.push({
-          type: "text_delta",
-          contentIndex,
-          delta: accumulatedText,
-          partial: output,
-        });
-        stream.push({
-          type: "text_end",
-          contentIndex,
-          content: accumulatedText,
-          partial: output,
-        });
-      }
-
-      for (const toolCall of toolCalls) {
-        const contentIndex = output.content.length;
-        output.content.push(toolCall);
-        stream.push({ type: "toolcall_start", contentIndex, partial: output });
-        stream.push({
-          type: "toolcall_delta",
-          contentIndex,
-          delta: safeJson(toolCall.arguments),
-          partial: output,
-        });
-        stream.push({ type: "toolcall_end", contentIndex, toolCall, partial: output });
-      }
+      setEstimatedUsage(model, output, prompt, visibleText + thinkingText);
 
       // The turn succeeded: record the session for reuse, or delete the
       // one-shot session record so it cannot accumulate (#71, #75). This
       // reply is already in the OpenCode session, so it counts as sent.
       if (piState) {
-        piState.opencodeSessionId =
-          capturedSessionId ?? piState.opencodeSessionId;
+        piState.opencodeSessionId = sessionId;
         piState.modelId = model.id;
         piState.toolsKey = serializeTools(context.tools);
         piState.systemPrompt = context.systemPrompt;
         piState.sentParts = [...transcriptParts, serializeMessage(output)];
       } else {
-        deleteOpenCodeSession(capturedSessionId);
+        deleteOpenCodeSession(sessionId);
       }
 
       const reason = toolCalls.length > 0 ? "toolUse" : finishReason;
       output.stopReason = reason;
+      await releaseTempDir();
       stream.push({ type: "done", reason, message: output });
       stream.end();
     } catch (error) {
-      if (timer) clearTimeout(timer);
+      closeOpen();
       // Any error, timeout, or abort drops the session ID so the next turn
       // starts fresh with the full transcript; the failed session record is
       // deleted best-effort and never fails the turn (#71, #75).
-      deleteOpenCodeSession(capturedSessionId);
+      deleteOpenCodeSession(sessionId);
       if (piState) dropOpencodeSession(piState);
       output.stopReason = options?.signal?.aborted ? "aborted" : "error";
       output.errorMessage =
@@ -1612,17 +1640,13 @@ export function streamOpenCode(
       if (output.content.length === 0) {
         output.content.push({ type: "text", text: `Error: ${output.errorMessage}` });
       }
+      await releaseTempDir();
       stream.push({ type: "error", reason: output.stopReason, error: output });
       stream.end();
     } finally {
-      if (timer) clearTimeout(timer);
-      // Only one-shot turns own their directory. Per-Pi-session directories
-      // persist for reuse and are removed at session teardown (#74).
-      if (tempDir) {
-        await rm(tempDir, { recursive: true, force: true }).catch(
-          () => undefined,
-        );
-      }
+      clearTimeout(timer);
+      options?.signal?.removeEventListener("abort", abort);
+      await releaseTempDir();
     }
   })();
 

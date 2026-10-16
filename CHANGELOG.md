@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **opencode-pi**: Replies stream. Turns go through one shared `opencode serve` per Pi process instead of a new `opencode run` each turn, so text and thinking reach Pi as the model writes them, not in one piece at the end. OpenCode v2 serves a different API and still runs `opencode run` per turn without streaming.
 - **opencode-pi**: Requires Pi 1.3 or later. Pi's tools now reach the model as OpenCode custom tools and use its native tool calling, replacing the `<pi_tool_call>` text markers. Pi still runs every tool call.
 
 ### Fixed
