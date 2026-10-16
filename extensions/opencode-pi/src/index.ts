@@ -1445,7 +1445,11 @@ export function streamOpenCode(
       }
 
       if (event.type === "permission.asked" && props.sessionID === sessionId) {
-        await reply(`/permission/${props.id}/reply`, { reply: "reject" });
+        // Rejecting one ask rejects every pending ask in the session, so a
+        // parallel call's ask can already be gone (404) by its turn.
+        await reply(`/permission/${props.id}/reply`, { reply: "reject" }).catch((error: unknown) => {
+          if (!/ failed with 404:/.test(String(error))) throw error;
+        });
         return false;
       }
 

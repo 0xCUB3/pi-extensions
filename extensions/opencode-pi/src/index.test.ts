@@ -85,6 +85,8 @@ type FakeServerConfig = {
   events?: unknown[];
   /** Send session.status idle after the events (default true). */
   idle?: boolean;
+  /** Permission IDs whose reply answers 404, as if already settled. */
+  settledPermissions?: string[];
 };
 
 const DEFAULT_TURN_EVENTS = [
@@ -142,6 +144,11 @@ http.createServer((req, res) => {
     const prompt = url.pathname.match(/^\\/session\\/([^/]+)\\/prompt_async$/);
     if (!prompt) {
       record(entry);
+      if ((config.settledPermissions || []).some((id) => url.pathname === "/permission/" + id + "/reply")) {
+        res.writeHead(404, { "content-type": "application/json" });
+        res.end(JSON.stringify({ _tag: "PermissionNotFoundError" }));
+        return;
+      }
       res.writeHead(200, { "content-type": "application/json" });
       res.end("true");
       return;
@@ -624,6 +631,30 @@ test("streamOpenCode turns finished Pi tool parts into Pi tool calls", async () 
   } finally {
     rmSync(captureDir, { recursive: true, force: true });
   }
+});
+
+test("streamOpenCode hands parallel Pi tool calls over when one rejection settles both asks", async () => {
+  const context: Context = { messages: [], tools: fakeContext(["read"]).tools };
+  const events = await collectStreamEvents(
+    fakeServer({
+      // OpenCode drops every pending ask when one is rejected.
+      settledPermissions: ["per_2"],
+      events: [
+        { type: "permission.asked", properties: { id: "per_1", permission: "pi_tool" } },
+        { type: "permission.asked", properties: { id: "per_2", permission: "pi_tool" } },
+        toolPart("read", "call_a", "error", { path: "a.txt" }),
+        toolPart("read", "call_b", "error", { path: "b.txt" }),
+        stepFinish("tool-calls"),
+      ],
+    }),
+    context,
+  );
+  const done = events.at(-1);
+  if (done?.type !== "done") return assert.fail(`expected done, got ${JSON.stringify(done)}`);
+  assert.deepEqual(
+    done.message.content.map((block) => (block.type === "toolCall" ? block.arguments : block.type)),
+    [{ path: "a.txt" }, { path: "b.txt" }],
+  );
 });
 
 test("streamOpenCode streams text deltas before the turn finishes", async () => {
