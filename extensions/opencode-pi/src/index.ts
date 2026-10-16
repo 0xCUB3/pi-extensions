@@ -7,7 +7,9 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   calculateCost,
   createAssistantMessageEventStream,
-  registerApiProvider,
+  getCurrentSystemPrompt,
+  getCurrentTools,
+  normalizeContext,
   type Api,
   type AssistantMessage,
   type AssistantMessageEventStream,
@@ -15,6 +17,7 @@ import {
   type ImageContent,
   type Message,
   type Model,
+  type SystemMessage,
   type ModelThinkingLevel,
   type SimpleStreamOptions,
   type TextContent,
@@ -22,6 +25,15 @@ import {
   type Tool,
   type ToolCall,
 } from "@earendil-works/pi-ai";
+import { registerApiProvider } from "@earendil-works/pi-ai/compat";
+
+type TranscriptMessage = Exclude<Message, SystemMessage>;
+
+interface BridgeContext {
+  systemPrompt: string;
+  tools: Tool[];
+  messages: TranscriptMessage[];
+}
 
 const PROVIDER_ID = "opencode-cli";
 const API_ID = "opencode-cli-runner";
@@ -88,7 +100,7 @@ export type OpenCodeModelInfo = {
 
 export type ParsedToolCall = {
   name: string;
-  arguments: Record<string, unknown>;
+  arguments: ToolCall["arguments"];
 };
 
 export type ToolCallParseResult =
@@ -870,7 +882,7 @@ function safeJson(value: unknown): string {
   }
 }
 
-function serializeMessage(message: Message): string {
+function serializeMessage(message: TranscriptMessage): string {
   if (message.role === "user") {
     return `USER:\n${contentToText(message.content)}`;
   }
@@ -905,7 +917,7 @@ function serializeTools(tools?: Tool[]): string {
   );
 }
 
-function buildPrompt(context: Context): string {
+function buildPrompt(context: BridgeContext): string {
   const sections: string[] = [];
   sections.push(`# Pi/OpenCode bridge instructions
 
@@ -1221,7 +1233,7 @@ function toolCallRejectionMessage(
   }
 }
 
-function parseArguments(value: unknown): Record<string, unknown> | undefined {
+function parseArguments(value: unknown): ToolCall["arguments"] | undefined {
   let parsed = value;
   if (typeof parsed === "string") {
     try {
@@ -1233,7 +1245,7 @@ function parseArguments(value: unknown): Record<string, unknown> | undefined {
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
     return undefined;
   }
-  return parsed as Record<string, unknown>;
+  return parsed as ToolCall["arguments"];
 }
 
 function repairUnescapedJsonStringQuotes(raw: string): string | undefined {
@@ -1479,7 +1491,7 @@ function dropOpencodeSession(state: PiSessionState): void {
   state.sentParts = undefined;
 }
 
-function serializedTranscriptParts(messages: Message[]): string[] {
+function serializedTranscriptParts(messages: TranscriptMessage[]): string[] {
   return messages.map(serializeMessage);
 }
 
@@ -1492,7 +1504,7 @@ function serializedTranscriptParts(messages: Message[]): string[] {
 function continuationDelta(
   state: PiSessionState,
   modelId: string,
-  context: Context,
+  context: BridgeContext,
   parts: string[],
 ): string[] | undefined {
   if (!state.opencodeSessionId) return undefined;
@@ -1538,7 +1550,11 @@ description: Pi bridge agent. OpenCode tools are denied; Pi tool calls are emitt
 mode: primary
 permission:
   "*": deny
-  read: deny
+  # OpenCode's free tier rejects requests that carry no OpenCode tools, so
+  # read stays declared but every path is denied.
+  read:
+    "*": deny
+    "/nonexistent/opencode-pi": allow
   edit: deny
   glob: deny
   grep: deny
@@ -1554,19 +1570,36 @@ permission:
   question: deny
   doom_loop: deny
 ---
-You are the OpenCode side of a Pi Coding Agent bridge. OpenCode tools are disabled. Reply in plain text, or emit <pi_tool_call>{"name":"...","arguments":{...}}</pi_tool_call> exactly when the prompt asks you to request a Pi tool.
+You are the OpenCode side of a Pi Coding Agent bridge. OpenCode tools are disabled and every OpenCode tool call fails. Reply in plain text, or emit <pi_tool_call>{"name":"...","arguments":{...}}</pi_tool_call> exactly when the prompt asks you to request a Pi tool.
 `,
     "utf8",
   );
   return dir;
 }
 
+/**
+ * Pi passes the prompt and tools as system messages in the transcript. Replay
+ * them into the current prompt and tool list, and keep the rest as the
+ * conversation the bridge serializes.
+ */
+function bridgeContext(context: Context): BridgeContext {
+  const { messages } = normalizeContext(context);
+  return {
+    systemPrompt: getCurrentSystemPrompt(messages),
+    tools: getCurrentTools(messages),
+    messages: messages.filter(
+      (message): message is TranscriptMessage => message.role !== "system",
+    ),
+  };
+}
+
 export function streamOpenCode(
   model: Model<Api>,
-  context: Context,
+  rawContext: Context,
   options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
   const stream = createAssistantMessageEventStream();
+  const context = bridgeContext(rawContext);
 
   (async () => {
     const output: AssistantMessage = {

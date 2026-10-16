@@ -11,10 +11,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { normalizeContext } from "@earendil-works/pi-ai";
 import {
-  clearApiProviders,
   getApiProvider,
-} from "@earendil-works/pi-ai";
+  unregisterApiProviders,
+} from "@earendil-works/pi-ai/compat";
 import type {
   Api,
   AssistantMessageEvent,
@@ -947,6 +948,10 @@ process.stdout.write(JSON.stringify({ type: "text", part: { text: "ok" } }) + "\
       "--agent", "pi-model", "--format", "json", "--thinking",
     ]);
     assert.match(invocation.agent, /mode: primary/);
+    // OpenCode's free tier answers 403 when a request declares no tools, so
+    // read stays declared with every path denied.
+    assert.match(invocation.agent, /\n  read:\n    "\*": deny\n/);
+    assert.equal(/\n  read: deny\n/.test(invocation.agent), false);
     assert.match(invocation.cwd, /opencode-pi-/);
   } finally {
     rmSync(captureDir, { recursive: true, force: true });
@@ -1145,7 +1150,7 @@ test("extension registration resolves the API handler for inference", async () =
     assert.equal(typeof apiProvider?.stream, "function");
   } finally {
     restoreEnv("OPENCODE_PI_MODELS", previousModels);
-    clearApiProviders();
+    unregisterApiProviders("opencode-cli");
   }
 });
 
@@ -1927,6 +1932,37 @@ function conversationContext(): Context {
   };
 }
 
+test("streamOpenCode replays Pi system messages into the prompt and tools", async () => {
+  const captureDir = mkdtempSync(join(tmpdir(), "opencode-pi-capture-"));
+  const capturePath = join(captureDir, "invocations.jsonl");
+  // Pi 1.3 hands providers the prompt and tools as transcript system messages.
+  const context = normalizeContext({
+    systemPrompt: "BASE PROMPT",
+    tools: fakeContext(["read"]).tools,
+    messages: [
+      { role: "user", content: "first question", timestamp: 1 },
+      { role: "system", content: "LATER INSTRUCTION", toolsAdded: fakeContext(["bash"]).tools, timestamp: 2 },
+      { role: "user", content: "second question", timestamp: 3 },
+    ],
+  });
+  try {
+    const message = await withFakeOpenCode(
+      sessionFakeScript(capturePath, "ses-system-1"),
+      () => streamOpenCode(fakeModel(), context).result(),
+    );
+    assert.equal(message.stopReason, "stop");
+    const stdin = readInvocations(capturePath)[0]?.stdin ?? "";
+    assert.match(stdin, /BASE PROMPT/);
+    assert.match(stdin, /LATER INSTRUCTION/);
+    assert.match(stdin, /"name": "read"/);
+    assert.match(stdin, /"name": "bash"/);
+    assert.match(stdin, /USER:\nfirst question[\s\S]*USER:\nsecond question/);
+    assert.equal(stdin.includes("SYSTEM:"), false);
+  } finally {
+    rmSync(captureDir, { recursive: true, force: true });
+  }
+});
+
 test("streamOpenCode reuses the session and sends only the transcript delta", async () => {
   const captureDir = mkdtempSync(join(tmpdir(), "opencode-pi-capture-"));
   const capturePath = join(captureDir, "invocations.jsonl");
@@ -2274,7 +2310,7 @@ test("bare opencode-pi uses a cancellable read-only panel without discovery or C
     assert.match(configPanelText, /OPENCODE_PI_MODELS: set/);
     for (const secret of secretValues) assert.equal(configPanelText.includes(secret), false);
   } finally {
-    clearApiProviders();
+    unregisterApiProviders("opencode-cli");
     restoreEnv("OPENCODE_PI_BIN", previousBin);
     restoreEnv("OPENCODE_PI_MODELS", previousModels);
     rmSync(dir, { recursive: true, force: true });
@@ -2376,7 +2412,7 @@ test("opencode-pi panel hides configured model IDs, supports cancellation, and p
     assert.equal(calls, 0);
     assert.ok(notifications.length > 0);
   } finally {
-    clearApiProviders();
+    unregisterApiProviders("opencode-cli");
     restoreEnv("OPENCODE_PI_BIN", previousBin);
     restoreEnv("OPENCODE_PI_MODELS", previousModels);
   }
@@ -2441,7 +2477,7 @@ test("opencode-pi keeps informational rows in detail and supports Back, another 
     assert.ok(escapedSelections[1]!.options.includes("Back"));
     assert.ok(escapedSelections[1]!.options.includes("Close"));
   } finally {
-    clearApiProviders();
+    unregisterApiProviders("opencode-cli");
     restoreEnv("OPENCODE_PI_MODELS", previousModels);
   }
 });
