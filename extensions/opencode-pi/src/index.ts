@@ -1533,6 +1533,9 @@ export function streamOpenCode(
           await writeFile(path, Buffer.from(file.url.slice(file.url.indexOf(",") + 1), "base64"));
           args.push("--file", path);
         }
+        // Abort events are not replayed, so a turn stopped during setup must
+        // not start the run at all.
+        if (controller.signal.aborted) throw turnStopped();
         const child = spawn(opencodeBin(), args, {
           cwd: sessionDir,
           stdio: ["pipe", "pipe", "pipe"],

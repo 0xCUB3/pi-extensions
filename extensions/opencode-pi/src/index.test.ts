@@ -12,7 +12,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { stopOpenCodeServer } from "./server.js";
+import { parseEvents, runningOpenCodeServer, stopOpenCodeServer, withOpenCodeServer } from "./server.js";
 import test from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { normalizeContext } from "@earendil-works/pi-ai";
@@ -1004,6 +1004,60 @@ process.stdin.on("end", () => {
     { type: "toolCall", id: "call_sh", name: "bash", arguments: { command: "ls" } },
   ]);
   assert.ok(Date.now() - started < 5_000);
+});
+
+test("streamOpenCode never starts an OpenCode v2 run after the turn already timed out", async () => {
+  const sentinelDir = mkdtempSync(join(tmpdir(), "opencode-pi-sentinel-"));
+  const sentinelPath = join(sentinelDir, "ran.marker");
+  try {
+    const message = await withFakeOpenCode(
+      `if (process.argv[2] === "run") require("node:fs").writeFileSync(${JSON.stringify(sentinelPath)}, "ran");
+process.exit(0);`,
+      // A 1ms budget runs out during setup, before the run would start.
+      () => streamOpenCode(fakeModel(), fakeContext(["read"]), { timeoutMs: 1 }).result(),
+      "opencode v2.0.16",
+    );
+    assert.equal(message.stopReason, "error");
+    assert.equal(message.errorMessage, "opencode timed out after 1ms");
+    assert.equal(existsSync(sentinelPath), false);
+  } finally {
+    rmSync(sentinelDir, { recursive: true, force: true });
+  }
+});
+
+test("parseEvents keeps CRLF event separators split across chunks", async () => {
+  const encoder = new TextEncoder();
+  const text = 'data: {"type":"a"}\r\n\r\ndata: {"type":"b"}\r\n\r\n';
+  // Split inside the first separator, between its \r and \n.
+  const cut = text.indexOf("\r\n\r\n") + 3;
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(encoder.encode(text.slice(0, cut)));
+      controller.enqueue(encoder.encode(text.slice(cut)));
+      controller.close();
+    },
+  });
+  const types: string[] = [];
+  for await (const event of parseEvents(body)) types.push(event.type);
+  assert.deepEqual(types, ["a", "b"]);
+});
+
+test("the shared server stops parsing its output once it is ready", async () => {
+  await withFakeOpenCode(
+    `if (process.argv[2] !== "serve") process.exit(1);
+require("node:http").createServer(() => undefined).listen(0, "127.0.0.1", function () {
+  console.log("opencode server listening on http://127.0.0.1:" + this.address().port);
+  let n = 0;
+  const timer = setInterval(() => { console.log("request log " + n); if (++n === 30) clearInterval(timer); }, 2);
+});`,
+    async () => {
+      const server = await withOpenCodeServer(process.env.OPENCODE_PI_BIN!, process.env, async (server) => server);
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      // One exit listener for the running server, plus Node's own.
+      assert.ok(server.child.listenerCount("exit") <= 2, `exit listeners: ${server.child.listenerCount("exit")}`);
+      assert.equal(runningOpenCodeServer(), server);
+    },
+  );
 });
 
 test("streamOpenCode reports OpenCode v2 run failures", async () => {

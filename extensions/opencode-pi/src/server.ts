@@ -61,10 +61,14 @@ function launch(bin: string, env: NodeJS.ProcessEnv): Promise<OpenCodeServer> {
       () => fail(`opencode serve did not start within ${START_TIMEOUT_MS}ms`),
       START_TIMEOUT_MS,
     );
+    let ready = false;
     const onOutput = (chunk: Buffer) => {
+      // Once ready, the listener only keeps the pipes drained.
+      if (ready) return;
       output = (output + chunk.toString()).slice(-OUTPUT_LIMIT);
       const url = output.match(/listening on (https?:\/\/\S+)/)?.[1];
       if (!url) return;
+      ready = true;
       clearTimeout(timer);
       child.removeListener("exit", onExit);
       child.on("exit", () => forget(instance));
@@ -206,11 +210,12 @@ export async function subscribeEvents(
   return events;
 }
 
-async function* parseEvents(body: ReadableStream<Uint8Array>): AsyncGenerator<ServerEvent> {
+export async function* parseEvents(body: ReadableStream<Uint8Array>): AsyncGenerator<ServerEvent> {
   const decoder = new TextDecoder();
   let buffer = "";
   for await (const chunk of body as unknown as AsyncIterable<Uint8Array>) {
-    buffer += decoder.decode(chunk, { stream: true }).replace(/\r\n/g, "\n");
+    // Normalize the whole buffer: a CRLF can be split across two chunks.
+    buffer = (buffer + decoder.decode(chunk, { stream: true })).replace(/\r\n/g, "\n");
     let end: number;
     while ((end = buffer.indexOf("\n\n")) >= 0) {
       const data = buffer
