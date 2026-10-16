@@ -98,21 +98,6 @@ export type OpenCodeModelInfo = {
   thinkingLevelMap?: ThinkingLevelMap;
 };
 
-export type ParsedToolCall = {
-  name: string;
-  arguments: ToolCall["arguments"];
-};
-
-export type ToolCallParseResult =
-  | { ok: true; calls: ParsedToolCall[]; cleanedText?: string }
-  | {
-      ok: false;
-      rejection:
-        | { reason: "malformed_markers" }
-        | { reason: "invalid_payload" }
-        | { reason: "unavailable_tool"; toolName: string };
-    };
-
 let registeredModels: OpenCodeModelInfo[] = [];
 let lastDiscoveryTime: number | undefined;
 let lastDiscoveryError: string | undefined;
@@ -889,7 +874,7 @@ function serializeMessage(message: TranscriptMessage): string {
 
   if (message.role === "toolResult") {
     return [
-      `PI TOOL RESULT (${message.toolName}, id=${message.toolCallId}, isError=${message.isError}):`,
+      `TOOL RESULT (${message.toolName}, id=${message.toolCallId}, isError=${message.isError}):`,
       contentToText(message.content),
     ].join("\n");
   }
@@ -899,15 +884,13 @@ function serializeMessage(message: TranscriptMessage): string {
       if (part.type === "text") return part.text;
       if (part.type === "thinking")
         return `<thinking>${part.thinking}</thinking>`;
-      return `<pi_tool_call>${safeJson({ id: part.id, name: part.name, arguments: part.arguments })}</pi_tool_call>`;
+      return `[called tool ${part.name} (id=${part.id}) with arguments ${JSON.stringify(part.arguments)}]`;
     },
   );
   return `ASSISTANT:\n${parts.join("\n")}`;
 }
 
-function serializeTools(tools?: Tool[]): string {
-  if (!tools || tools.length === 0)
-    return "No Pi tools are available for this turn.";
+function serializeTools(tools: Tool[]): string {
   return safeJson(
     tools.map((tool) => ({
       name: tool.name,
@@ -917,460 +900,24 @@ function serializeTools(tools?: Tool[]): string {
   );
 }
 
+const BRIDGE_INSTRUCTIONS = `You are the model behind Pi Coding Agent, reached through the OpenCode CLI.
+Your tools are Pi's tools. Pi runs every tool call and sends the result back in the next message.
+Call tools with your normal tool calling. Never write a tool call out as text.`;
+
 function buildPrompt(context: BridgeContext): string {
-  const sections: string[] = [];
-  sections.push(`# Pi/OpenCode bridge instructions
-
-You are being used as the model backend for Pi Coding Agent through the OpenCode CLI.
-OpenCode's own tools are disabled. Do not try to use OpenCode tools.
-
-If you need Pi to run a tool, your entire response must contain only one or more tool-call blocks separated by whitespace:
-<pi_tool_call>{"name":"tool_name","arguments":{}}</pi_tool_call>
-
-Rules for Pi tool calls:
-- Use only exact tool names listed in the "Available Pi tools" section.
-- The JSON inside every marker must be valid JSON with a string "name" and an object "arguments".
-- Escape every quote inside a JSON string value as \\\", especially quotes inside shell commands.
-- Markers are bridge control syntax. Never quote them, explain them, put them in prose, or wrap them in Markdown fences.
-- Never output a marker as an example. A marker means you are requesting immediate execution.
-- Do not put any text before or after tool-call markers. Mixed prose and markers will not execute.
-- NEVER use XML-style tool-use syntax (e.g., <bash>, <read>, <glob>, <grep>, <edit>, <task>, <arg_key>, <arg_value>). These are your native tool-use format and are completely disabled.
-- NEVER use Claude Code XML-style markup (e.g., <bash command="...">, <read path="...">, <arg_key>, <arg_value>). This is not a tool-call and will be treated as plain text.
-- If you can answer without a tool, answer normally in plain text and do not emit any marker.
-- After Pi returns tool results, match them to prior tool-call IDs in the transcript, then either answer or request another Pi tool call.`);
-
-  if (context.systemPrompt?.trim()) {
-    sections.push(`# Pi system prompt
-
-${context.systemPrompt}`);
+  const sections = [`# Pi/OpenCode bridge instructions\n\n${BRIDGE_INSTRUCTIONS}`];
+  if (context.systemPrompt.trim()) {
+    sections.push(`# Pi system prompt\n\n${context.systemPrompt}`);
   }
-
-  sections.push(`# Available Pi tools
-
-${serializeTools(context.tools)}`);
-
-  if (context.messages.length > 0) {
-    sections.push(`# Conversation transcript
-
-${context.messages.map(serializeMessage).join("\n\n---\n\n")}`);
-  } else {
-    sections.push("# Conversation transcript\n\n(no prior messages)");
-  }
-
+  sections.push(
+    `# Conversation transcript\n\n${
+      context.messages.length > 0
+        ? context.messages.map(serializeMessage).join("\n\n---\n\n")
+        : "(no prior messages)"
+    }`,
+  );
   sections.push("Now produce the next assistant message for Pi.");
   return sections.join("\n\n---\n\n");
-}
-
-const MARKER_OPEN = "<pi_tool_call>";
-
-// Detects marker syntax anywhere in the response, not just at the start, so
-// prose-then-marker and marker-then-prose responses are treated the same
-// way: either both are rejected as malformed tool-call attempts, or neither
-// is. A one-sided check let malformed leading prose silently leak raw
-// marker text into the visible chat response while malformed trailing prose
-// hard-failed the turn.
-//
-// Requires the opening marker specifically: a response can only be
-// *attempting* a tool call if it emits the open tag. A lone closing marker
-// (e.g. prose that merely quotes or discusses `</pi_tool_call>`) is not a
-// plausible tool-call attempt and must not hard-fail the turn.
-export function isToolCallMarkerResponse(text: string): boolean {
-  const trimmed = text.trim();
-  return trimmed.includes(MARKER_OPEN);
-}
-
-type MarkerClose = { index: number; length: number };
-
-// Models occasionally vary whitespace, separators, plurality, or case in the
-// closing tag. Keep the opening marker strict, but accept this bounded family
-// of unmistakable Pi marker closers.
-const MARKER_CLOSE_PATTERN = /^<\s*\/\s*pi[-_]tool[-_]calls?\s*>/i;
-
-// A closing marker inside a JSON string (e.g. tool arguments that happen to
-// contain the literal text "</pi_tool_call>") must not be treated as the
-// real boundary, so this walks the JSON string-escaping state rather than
-// matching the close tag with a plain regex.
-function findMarkerClose(text: string, from: number): MarkerClose | undefined {
-  let inString = false;
-  let escaped = false;
-  for (let i = from; i < text.length; i++) {
-    const char = text[i];
-    if (inString) {
-      if (escaped) escaped = false;
-      else if (char === "\\") escaped = true;
-      else if (char === '"') inString = false;
-      continue;
-    }
-    if (char === '"') {
-      inString = true;
-      continue;
-    }
-    if (char !== "<") continue;
-    const match = text.slice(i).match(MARKER_CLOSE_PATTERN);
-    if (match) return { index: i, length: match[0].length };
-  }
-  return undefined;
-}
-
-// Some models emit a complete marker payload but omit only the closing tag.
-// Recover that narrow case by locating one complete top-level JSON object or
-// array and requiring whitespace-only content afterward. Payload validation
-// and the current-turn tool allowlist are still applied by the caller.
-function recoverUnclosedMarkerBody(
-  text: string,
-  bodyStart: number,
-): string | undefined {
-  let start = bodyStart;
-  while (/\s/.test(text[start] ?? "")) start++;
-  const first = text[start];
-  if (first !== "{" && first !== "[") return undefined;
-
-  const stack: string[] = [first];
-  let inString = false;
-  let escaped = false;
-  for (let i = start + 1; i < text.length; i++) {
-    const char = text[i];
-    if (inString) {
-      if (escaped) escaped = false;
-      else if (char === "\\") escaped = true;
-      else if (char === '"') inString = false;
-      continue;
-    }
-    if (char === '"') {
-      inString = true;
-      continue;
-    }
-    if (char === "{" || char === "[") {
-      stack.push(char);
-      continue;
-    }
-    if (char !== "}" && char !== "]") continue;
-
-    const expected = char === "}" ? "{" : "[";
-    if (stack.pop() !== expected) return undefined;
-    if (stack.length === 0) {
-      const end = i + 1;
-      return text.slice(end).trim() ? undefined : text.slice(bodyStart, end);
-    }
-  }
-  return undefined;
-}
-
-function normalizeQuotedToolCallResponse(text: string): string {
-  const trimmed = text.trim();
-  if (!trimmed.startsWith('"') || !trimmed.endsWith('"')) return text;
-  try {
-    const decoded: unknown = JSON.parse(trimmed);
-    return typeof decoded === "string" && decoded.includes(MARKER_OPEN)
-      ? decoded
-      : text;
-  } catch {
-    return text;
-  }
-}
-
-/**
- * Extract <pi_tool_call> marker bodies from the response text.
- * Lenient: markers are extracted anywhere in the text, even with prose
- * before or after them, matching how real models behave. A marker whose
- * payload cannot be recovered (truncated JSON, unclosed with trailing
- * content) is recorded as an invalid span instead of aborting extraction,
- * so valid sibling markers still parse and the unrecoverable text can be
- * stripped from the displayed response (#39).
- */
-type MarkerSpan = { start: number; end: number };
-
-type ExtractedMarker = { body: string; start: number; end: number };
-
-type MarkerExtraction = {
-  markers: ExtractedMarker[];
-  invalidSpans: MarkerSpan[];
-};
-
-function toolCallMarkers(text: string): MarkerExtraction | undefined {
-  const trimmed = text.trim();
-  const markers: ExtractedMarker[] = [];
-  const invalidSpans: MarkerSpan[] = [];
-  let cursor = 0;
-  while (cursor < trimmed.length) {
-    const openIndex = trimmed.indexOf(MARKER_OPEN, cursor);
-    if (openIndex === -1) break;
-
-    const bodyStart = openIndex + MARKER_OPEN.length;
-    const close = findMarkerClose(trimmed, bodyStart);
-    if (close) {
-      markers.push({
-        body: trimmed.slice(bodyStart, close.index),
-        start: openIndex,
-        end: close.index + close.length,
-      });
-      cursor = close.index + close.length;
-      continue;
-    }
-
-    const recovered = recoverUnclosedMarkerBody(trimmed, bodyStart);
-    if (recovered !== undefined) {
-      const end = bodyStart + recovered.length;
-      markers.push({ body: recovered, start: openIndex, end });
-      cursor = end;
-      continue;
-    }
-
-    // Unrecoverable marker: everything up to the next opening marker (or
-    // the end of the response) is inside the attempted marker, so strip it.
-    const nextOpen = trimmed.indexOf(MARKER_OPEN, bodyStart);
-    const spanEnd = nextOpen === -1 ? trimmed.length : nextOpen;
-    invalidSpans.push({ start: openIndex, end: spanEnd });
-    cursor = spanEnd;
-  }
-  if (markers.length === 0 && invalidSpans.length === 0) return undefined;
-  return { markers, invalidSpans };
-}
-
-function stripMarkerSpans(text: string, spans: MarkerSpan[]): string {
-  const sorted = [...spans].sort((a, b) => a.start - b.start);
-  let cleaned = "";
-  let cursor = 0;
-  for (const span of sorted) {
-    if (span.start < cursor) continue;
-    cleaned += text.slice(cursor, span.start);
-    cursor = Math.max(cursor, span.end);
-  }
-  cleaned += text.slice(cursor);
-  return cleaned;
-}
-
-export function parseToolCallResponse(
-  text: string,
-  allowedToolNames?: ReadonlySet<string>,
-): ToolCallParseResult {
-  const normalizedText = normalizeQuotedToolCallResponse(text);
-  if (!isToolCallMarkerResponse(normalizedText)) return { ok: true, calls: [] };
-
-  const extraction = toolCallMarkers(normalizedText);
-  if (!extraction) return { ok: true, calls: [] };
-
-  const parsed: ParsedToolCall[] = [];
-  const strippedSpans: MarkerSpan[] = [...extraction.invalidSpans];
-  let payloadRejection:
-    | { reason: "invalid_payload" }
-    | undefined;
-
-  for (const marker of extraction.markers) {
-    const calls = parseToolCallJson(marker.body);
-    if (calls.length === 0) {
-      // Skip the invalid body but keep any valid sibling calls; if no
-      // call survives, surface the original corrective diagnostic.
-      payloadRejection ??= { reason: "invalid_payload" };
-      strippedSpans.push({ start: marker.start, end: marker.end });
-      continue;
-    }
-    const unavailable = calls.find(
-      (call) => allowedToolNames && !allowedToolNames.has(call.name),
-    );
-    if (unavailable) {
-      return {
-        ok: false,
-        rejection: {
-          reason: "unavailable_tool",
-          toolName: unavailable.name,
-        },
-      };
-    }
-    parsed.push(...calls);
-  }
-
-  if (parsed.length === 0 && payloadRejection) {
-    return { ok: false, rejection: payloadRejection };
-  }
-
-  if (strippedSpans.length === 0) return { ok: true, calls: parsed };
-  return {
-    ok: true,
-    calls: parsed,
-    cleanedText: stripMarkerSpans(normalizedText, strippedSpans),
-  };
-}
-
-export function parseToolCalls(
-  text: string,
-  allowedToolNames?: ReadonlySet<string>,
-): ParsedToolCall[] {
-  const result = parseToolCallResponse(text, allowedToolNames);
-  return result.ok ? result.calls : [];
-}
-
-/**
- * Detects if the model response contains XML-style tool-use markup
- * (e.g., Claude Code's <bash>, <read>, <arg_key>, <arg_value> tags).
- * Returns the detected tool name if found, or undefined if not.
- */
-function detectXmlToolUse(text: string): string | undefined {
-  // Match XML-style tool tags that look like tool invocations.
-  // These are NOT <pi_tool_call> markers — they are the model's native format.
-  // Claude Code uses <bash>, <read>, <edit>, etc. directly, but may also
-  // emit <arg_key>/<arg_value> pairs inside those tags.
-  const xmlToolPattern = /<(bash|read|edit|write|glob|grep|ls|webfetch|websearch|task|todowrite|question|skill|lsp|external_directory|doom_loop|agent|arg_key|arg_value)\b/i;
-  const match = text.match(xmlToolPattern);
-  return match ? match[1].toLowerCase() : undefined;
-}
-
-function toolCallRejectionMessage(
-  result: Extract<ToolCallParseResult, { ok: false }>,
-  allowedToolNames: ReadonlySet<string>,
-): string {
-  switch (result.rejection.reason) {
-    case "malformed_markers":
-      return "OpenCode returned malformed Pi tool-call markers. Ensure each marker contains valid JSON with a string \"name\" and object \"arguments\".";
-    case "invalid_payload":
-      return 'OpenCode returned an invalid Pi tool-call payload. Each marker must contain valid JSON with a non-empty string "name" and object "arguments".';
-    case "unavailable_tool": {
-      const available = [...allowedToolNames].map((name) =>
-        JSON.stringify(name),
-      );
-      return `OpenCode requested unavailable Pi tool ${JSON.stringify(result.rejection.toolName)}. Use only tools available in the current Pi turn: ${available.length > 0 ? available.join(", ") : "none"}.`;
-    }
-  }
-}
-
-function parseArguments(value: unknown): ToolCall["arguments"] | undefined {
-  let parsed = value;
-  if (typeof parsed === "string") {
-    try {
-      parsed = JSON.parse(parsed);
-    } catch {
-      return undefined;
-    }
-  }
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-    return undefined;
-  }
-  return parsed as ToolCall["arguments"];
-}
-
-function repairUnescapedJsonStringQuotes(raw: string): string | undefined {
-  const trimmed = raw.trim();
-  const matchingContainer =
-    (trimmed.startsWith("{") && trimmed.endsWith("}")) ||
-    (trimmed.startsWith("[") && trimmed.endsWith("]"));
-  if (!matchingContainer) return undefined;
-
-  let repaired = "";
-  let inString = false;
-  let escaped = false;
-  let changed = false;
-
-  for (let index = 0; index < trimmed.length; index++) {
-    const char = trimmed[index];
-    if (!inString) {
-      repaired += char;
-      if (char === '"') inString = true;
-      continue;
-    }
-    if (escaped) {
-      repaired += char;
-      escaped = false;
-      continue;
-    }
-    if (char === "\\") {
-      repaired += char;
-      escaped = true;
-      continue;
-    }
-    if (char !== '"') {
-      repaired += char;
-      continue;
-    }
-
-    let nextIndex = index + 1;
-    while (/\s/.test(trimmed[nextIndex] ?? "")) nextIndex++;
-    const next = trimmed[nextIndex];
-    if (next === undefined || [",", ":", "}", "]"].includes(next)) {
-      repaired += char;
-      inString = false;
-    } else {
-      repaired += '\\"';
-      changed = true;
-    }
-  }
-
-  return changed && !inString ? repaired : undefined;
-}
-
-function parseToolCallJson(raw: string): ParsedToolCall[] {
-  let value: unknown;
-  try {
-    value = JSON.parse(raw.trim());
-  } catch {
-    const repaired = repairUnescapedJsonStringQuotes(raw);
-    if (!repaired) return [];
-    try {
-      value = JSON.parse(repaired);
-    } catch {
-      return [];
-    }
-  }
-
-  const container = value as { tool_calls?: unknown } | null;
-  const candidates = Array.isArray(value)
-    ? value
-    : Array.isArray(container?.tool_calls)
-      ? container.tool_calls
-      : [value];
-  if (candidates.length === 0) return [];
-
-  const calls: ParsedToolCall[] = [];
-  for (const rawCandidate of candidates) {
-    if (
-      typeof rawCandidate !== "object" ||
-      rawCandidate === null ||
-      Array.isArray(rawCandidate)
-    ) {
-      return [];
-    }
-    const candidate = rawCandidate as {
-      name?: unknown;
-      tool?: unknown;
-      arguments?: unknown;
-      args?: unknown;
-      input?: unknown;
-      function?: { name?: unknown; arguments?: unknown };
-    };
-    const nameValue =
-      typeof candidate.name === "string"
-        ? candidate.name
-        : typeof candidate.tool === "string"
-          ? candidate.tool
-          : candidate.function?.name;
-
-    let argumentsValue: unknown;
-    if (Object.hasOwn(candidate, "arguments")) {
-      argumentsValue = candidate.arguments;
-    } else if (Object.hasOwn(candidate, "args")) {
-      argumentsValue = candidate.args;
-    } else if (Object.hasOwn(candidate, "input")) {
-      argumentsValue = candidate.input;
-    } else if (
-      candidate.function &&
-      typeof candidate.function === "object" &&
-      Object.hasOwn(candidate.function, "arguments")
-    ) {
-      argumentsValue = candidate.function.arguments;
-    } else {
-      return [];
-    }
-
-    const args = parseArguments(argumentsValue);
-    if (
-      typeof nameValue !== "string" ||
-      !nameValue.trim() ||
-      !args
-    ) {
-      return [];
-    }
-    calls.push({ name: nameValue, arguments: args });
-  }
-  return calls;
 }
 
 /**
@@ -1523,13 +1070,7 @@ function buildContinuationPrompt(deltaParts: string[]): string {
   return [
     "# Continued Pi/OpenCode bridge turn",
     "",
-    "This message continues your existing OpenCode session: the Pi system prompt,",
-    "tool list, and earlier transcript are already in context. Do not ask for them again.",
-    "If you need Pi to run a tool, your entire response must contain only one or more",
-    "tool-call blocks separated by whitespace:",
-    '<pi_tool_call>{"name":"tool_name","arguments":{}}</pi_tool_call>',
-    "Use only exact tool names from the earlier tool list. Never quote markers, explain",
-    "them, or wrap them in Markdown fences. If you can answer without a tool, answer normally.",
+    "Pi handled the tool calls from your last step. OpenCode reports them as rejected only because Pi, not OpenCode, runs them.",
     "",
     "# New transcript since your last response",
     "",
@@ -1539,42 +1080,144 @@ function buildContinuationPrompt(deltaParts: string[]): string {
   ].join("\n");
 }
 
-async function createTempAgentDir(): Promise<string> {
-  const dir = await mkdtemp(join(tmpdir(), "opencode-pi-"));
-  const agentsDir = join(dir, ".opencode", "agents");
-  await mkdir(agentsDir, { recursive: true });
+// OpenCode's free tier answers 403 unless the request declares a tool named
+// `read`, so the bridge always declares one.
+const REQUIRED_TOOL = "read";
+// Custom tools ask for this permission, which `opencode run` auto-rejects.
+// The rejection ends OpenCode's step without running anything, and the
+// tool_use event hands the call to Pi.
+const PI_TOOL_PERMISSION = "pi_tool";
+const TOOL_NAME_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+// OpenCode gates these built-in tool IDs behind the first ID's permission.
+const PERMISSION_GROUPS = [
+  ["edit", "write", "apply_patch"],
+  ["read", "list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource"],
+];
+
+function permissionKey(name: string): string {
+  return PERMISSION_GROUPS.find((group) => group.includes(name))?.[0] ?? name;
+}
+
+type JsonSchema = {
+  description?: string;
+  properties?: Record<string, JsonSchema>;
+  required?: string[];
+  [key: string]: unknown;
+};
+
+function parameterSchema(tool: Tool): JsonSchema {
+  // The JSON round trip drops TypeBox's symbol keys.
+  const schema = JSON.parse(JSON.stringify(tool.parameters ?? {})) as JsonSchema;
+  return schema && typeof schema === "object" ? schema : {};
+}
+
+/**
+ * OpenCode marks every custom-tool argument as required, so optional Pi
+ * arguments are declared nullable and the nulls are dropped again in
+ * {@link piArguments}.
+ */
+export function openCodeToolArgs(tool: Tool): Record<string, JsonSchema> {
+  const { properties = {}, required = [] } = parameterSchema(tool);
+  return Object.fromEntries(
+    Object.entries(properties).map(([name, schema]) => [
+      name,
+      required.includes(name)
+        ? schema
+        : { description: schema.description, anyOf: [schema, { type: "null" }] },
+    ]),
+  );
+}
+
+export function piArguments(tool: Tool, input: unknown): ToolCall["arguments"] {
+  if (typeof input !== "object" || input === null || Array.isArray(input)) return {};
+  const { required = [] } = parameterSchema(tool);
+  return Object.fromEntries(
+    Object.entries(input).filter(
+      ([name, value]) => value !== null || required.includes(name),
+    ),
+  ) as ToolCall["arguments"];
+}
+
+function piToolSource(tool: Tool): string {
+  return `export default {
+  description: ${JSON.stringify(tool.description ?? "")},
+  args: ${JSON.stringify(openCodeToolArgs(tool))},
+  async execute(_args, context) {
+    await context.ask({ permission: ${JSON.stringify(PI_TOOL_PERMISSION)}, patterns: ["*"], always: [], metadata: {} });
+    return "Pi runs this tool and sends the result in the next message.";
+  },
+};
+`;
+}
+
+function unavailableToolSource(available: string[]): string {
+  const message = available.length
+    ? `Unavailable in this session. Use only these tools: ${available.join(", ")}.`
+    : "Unavailable in this session. No tools are available.";
+  return `export default {
+  description: "Unavailable in this session. Do not call.",
+  args: {},
+  async execute() {
+    return ${JSON.stringify(message)};
+  },
+};
+`;
+}
+
+/**
+ * Write the locked-down agent and one OpenCode custom tool per Pi tool. Every
+ * OpenCode tool the agent can see is one of these files. Pi tools never run
+ * inside OpenCode, and the unavailable stubs only return a message.
+ */
+export async function writeBridgeConfig(dir: string, tools: Tool[]): Promise<void> {
+  const piNames = tools.map((tool) => tool.name);
+  const invalid = piNames.find((name) => !TOOL_NAME_PATTERN.test(name));
+  if (invalid) {
+    throw new Error(`Pi tool name ${JSON.stringify(invalid)} is not a valid OpenCode tool name.`);
+  }
+  const allowed = new Set([REQUIRED_TOOL, ...piNames].map(permissionKey));
+  const declared = new Set([
+    REQUIRED_TOOL,
+    ...piNames,
+    ...PERMISSION_GROUPS.filter((group) => allowed.has(group[0]!)).flat(),
+  ]);
+
+  const configDir = join(dir, ".opencode");
+  const toolsDir = join(configDir, "tools");
+  await rm(toolsDir, { recursive: true, force: true });
+  await mkdir(join(configDir, "agents"), { recursive: true });
+  await mkdir(toolsDir, { recursive: true });
+  await Promise.all(
+    [...declared].map((name) => {
+      const tool = tools.find((candidate) => candidate.name === name);
+      return writeFile(
+        join(toolsDir, `${name}.js`),
+        tool ? piToolSource(tool) : unavailableToolSource(piNames),
+        "utf8",
+      );
+    }),
+  );
+  const permissions = [
+    `  "*": deny`,
+    ...[...allowed].map((key) => `  ${JSON.stringify(key)}: allow`),
+    `  ${JSON.stringify(PI_TOOL_PERMISSION)}: ask`,
+  ];
   await writeFile(
-    join(agentsDir, `${AGENT_ID}.md`),
+    join(configDir, "agents", `${AGENT_ID}.md`),
     `---
-description: Pi bridge agent. OpenCode tools are denied; Pi tool calls are emitted as text markers.
+description: Pi bridge agent. Its tools are Pi's tools, which Pi runs.
 mode: primary
 permission:
-  "*": deny
-  # OpenCode's free tier rejects requests that carry no OpenCode tools, so
-  # read stays declared but every path is denied.
-  read:
-    "*": deny
-    "/nonexistent/opencode-pi": allow
-  edit: deny
-  glob: deny
-  grep: deny
-  list: deny
-  bash: deny
-  task: deny
-  external_directory: deny
-  todowrite: deny
-  webfetch: deny
-  websearch: deny
-  lsp: deny
-  skill: deny
-  question: deny
-  doom_loop: deny
+${permissions.join("\n")}
 ---
-You are the OpenCode side of a Pi Coding Agent bridge. OpenCode tools are disabled and every OpenCode tool call fails. Reply in plain text, or emit <pi_tool_call>{"name":"...","arguments":{...}}</pi_tool_call> exactly when the prompt asks you to request a Pi tool.
+${BRIDGE_INSTRUCTIONS}
 `,
     "utf8",
   );
-  return dir;
+}
+
+function createTempAgentDir(): Promise<string> {
+  return mkdtemp(join(tmpdir(), "opencode-pi-"));
 }
 
 /**
@@ -1619,7 +1262,7 @@ export function streamOpenCode(
     let stderr = "";
     let stdoutRemainder = "";
     let capturedSessionId: string | undefined;
-    let opencodeToolUse: string | undefined;
+    const toolCalls: ToolCall[] = [];
     let opencodeError: string | undefined;
     let finishReason: "stop" | "length" = "stop";
     let timedOut = false;
@@ -1662,6 +1305,7 @@ export function streamOpenCode(
             tempDir = dir;
             return dir;
           });
+      if (!isContinuation) await writeBridgeConfig(sessionDir, context.tools);
       if (options?.signal?.aborted) throw new Error("Request was aborted");
       const images = imageContentsForModel(
         sentMessages,
@@ -1786,10 +1430,22 @@ export function streamOpenCode(
           return;
         }
 
+        // Pi tools stop OpenCode's step through a rejected permission ask,
+        // so a Pi tool's tool_use event is a call for Pi to run. Calls to the
+        // unavailable stubs already returned their message inside OpenCode.
         if (event.type === "tool_use") {
-          opencodeToolUse = event.part?.tool
-            ? String(event.part.tool)
-            : "unknown";
+          const name = String(event.part?.tool ?? "");
+          const tool = context.tools.find((candidate) => candidate.name === name);
+          if (!tool) return;
+          toolCalls.push({
+            type: "toolCall",
+            id:
+              typeof event.part?.callID === "string" && event.part.callID
+                ? event.part.callID
+                : `opencode_pi_${Date.now()}_${toolCalls.length}`,
+            name,
+            arguments: piArguments(tool, event.part?.state?.input),
+          });
           return;
         }
 
@@ -1840,41 +1496,9 @@ export function streamOpenCode(
         throw new Error(stderr.trim() || `opencode exited with code ${code}`);
       }
       if (opencodeError) throw new Error(opencodeError);
-      if (opencodeToolUse) {
-        throw new Error(
-          `OpenCode attempted to use its disabled native tool (${JSON.stringify(opencodeToolUse)}). Retry the request; Pi tools must be requested with <pi_tool_call>{"name":"...","arguments":{}}</pi_tool_call> markers.`,
-        );
-      }
-
-      const allowedToolNames = new Set(
-        context.tools?.map((tool) => tool.name) ?? [],
-      );
-      const toolCallResult = parseToolCallResponse(
-        accumulatedText,
-        allowedToolNames,
-      );
-      if (!toolCallResult.ok) {
-        throw new Error(
-          toolCallRejectionMessage(toolCallResult, allowedToolNames),
-        );
-      }
-      const toolCalls = toolCallResult.calls;
-      // Unrecoverable marker text is stripped so it never leaks into the
-      // visible chat response; remaining prose still displays normally.
-      const displayText = toolCallResult.cleanedText ?? accumulatedText;
-      if (toolCalls.length === 0 && displayText.trim()) {
-        // Check if the model tried to use XML-style tool-use instead of
-        // <pi_tool_call> markers — a common mistake with Claude-based models.
-        const xmlTool = detectXmlToolUse(displayText);
-        if (xmlTool) {
-          throw new Error(
-            `OpenCode attempted to use its disabled native tool (${JSON.stringify(xmlTool)}). This bridge only accepts <pi_tool_call>{"name":"...","arguments":{}}</pi_tool_call> markers. Do not use XML-style tool-use syntax.`,
-          );
-        }
-      }
       if (
         toolCalls.length === 0 &&
-        !displayText.trim() &&
+        !accumulatedText.trim() &&
         !accumulatedThinking.trim()
       ) {
         const stderrMsg = stderr.trim();
@@ -1902,19 +1526,6 @@ export function streamOpenCode(
         prompt,
         accumulatedText + accumulatedThinking,
       );
-      // The turn succeeded: record the session for reuse, or delete the
-      // one-shot session record so it cannot accumulate (#71, #75).
-      if (piState) {
-        piState.opencodeSessionId =
-          capturedSessionId ?? piState.opencodeSessionId;
-        piState.modelId = model.id;
-        piState.toolsKey = serializeTools(context.tools);
-        piState.systemPrompt = context.systemPrompt ?? "";
-        piState.sentParts = transcriptParts;
-      } else {
-        deleteOpenCodeSession(capturedSessionId);
-      }
-
       if (accumulatedThinking) {
         const thinkingIndex = output.content.length;
         output.content.push({ type: "thinking", thinking: accumulatedThinking });
@@ -1937,59 +1548,54 @@ export function streamOpenCode(
         });
       }
 
-      if (toolCalls.length > 0) {
-        output.stopReason = "toolUse";
-        for (const call of toolCalls) {
-          const toolCall: ToolCall = {
-            type: "toolCall",
-            id: `opencode_pi_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-            name: call.name,
-            arguments: call.arguments,
-          };
-          const contentIndex = output.content.length;
-          output.content.push(toolCall);
-          stream.push({
-            type: "toolcall_start",
-            contentIndex,
-            partial: output,
-          });
-          stream.push({
-            type: "toolcall_delta",
-            contentIndex,
-            delta: safeJson(toolCall.arguments),
-            partial: output,
-          });
-          stream.push({
-            type: "toolcall_end",
-            contentIndex,
-            toolCall,
-            partial: output,
-          });
-        }
-        stream.push({ type: "done", reason: "toolUse", message: output });
-        stream.end();
-        return;
-      }
-
-      output.stopReason = finishReason;
-      if (displayText) {
+      if (accumulatedText.trim()) {
         const contentIndex = output.content.length;
-        output.content.push({ type: "text", text: displayText });
+        output.content.push({ type: "text", text: accumulatedText });
         stream.push({ type: "text_start", contentIndex, partial: output });
         stream.push({
           type: "text_delta",
           contentIndex,
-          delta: displayText,
+          delta: accumulatedText,
           partial: output,
         });
         stream.push({
           type: "text_end",
           contentIndex,
-          content: displayText,
+          content: accumulatedText,
           partial: output,
         });
       }
-      stream.push({ type: "done", reason: finishReason, message: output });
+
+      for (const toolCall of toolCalls) {
+        const contentIndex = output.content.length;
+        output.content.push(toolCall);
+        stream.push({ type: "toolcall_start", contentIndex, partial: output });
+        stream.push({
+          type: "toolcall_delta",
+          contentIndex,
+          delta: safeJson(toolCall.arguments),
+          partial: output,
+        });
+        stream.push({ type: "toolcall_end", contentIndex, toolCall, partial: output });
+      }
+
+      // The turn succeeded: record the session for reuse, or delete the
+      // one-shot session record so it cannot accumulate (#71, #75). This
+      // reply is already in the OpenCode session, so it counts as sent.
+      if (piState) {
+        piState.opencodeSessionId =
+          capturedSessionId ?? piState.opencodeSessionId;
+        piState.modelId = model.id;
+        piState.toolsKey = serializeTools(context.tools);
+        piState.systemPrompt = context.systemPrompt;
+        piState.sentParts = [...transcriptParts, serializeMessage(output)];
+      } else {
+        deleteOpenCodeSession(capturedSessionId);
+      }
+
+      const reason = toolCalls.length > 0 ? "toolUse" : finishReason;
+      output.stopReason = reason;
+      stream.push({ type: "done", reason, message: output });
       stream.end();
     } catch (error) {
       if (timer) clearTimeout(timer);
@@ -2065,7 +1671,7 @@ function statusLines(): string[] {
     "OpenCode login is not required for the bundled free OpenCode models.",
   );
   lines.push(
-    "OpenCode tools are disabled; Pi tool use is bridged with prompt-level tool-call markers.",
+    "OpenCode tools are disabled; Pi's tools are passed through as OpenCode custom tools that Pi runs.",
   );
   lines.push(
     "Run /opencode-pi update to refresh the model list from opencode.",
