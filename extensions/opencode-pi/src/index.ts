@@ -888,7 +888,8 @@ function serializeTools(tools: Tool[]): string {
 
 const BRIDGE_INSTRUCTIONS = `You are the model behind Pi Coding Agent, reached through the OpenCode CLI.
 Your tools are Pi's tools. Pi runs every tool call and sends the result back in the next message.
-Call tools with your normal tool calling. Never write a tool call out as text.`;
+Call tools with your normal tool calling. Never write a tool call out as text.
+OpenCode's <env> block describes the bridge's scratch directory. Pi runs your tools in the working directory from Pi's system prompt.`;
 
 function buildPrompt(context: BridgeContext): string {
   const sections = [`# Pi/OpenCode bridge instructions\n\n${BRIDGE_INSTRUCTIONS}`];
@@ -1221,6 +1222,9 @@ export async function writeBridgeConfig(
         ...[...allowed].map((key) => `  ${JSON.stringify(key)}: allow`),
         `  ${JSON.stringify(PI_TOOL_PERMISSION)}: ask`,
       ];
+  // OpenCode would spend a second request on the same model to title each
+  // session. On the free tier that request shares, and hits, the rate limit.
+  await writeFile(join(configDir, "agents", "title.md"), "---\ndisable: true\n---\n", "utf8");
   await writeFile(
     join(configDir, "agents", `${AGENT_ID}.md`),
     `---

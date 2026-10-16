@@ -531,6 +531,8 @@ test("writeBridgeConfig exposes only Pi tools and inert stubs to OpenCode", asyn
     // Stale files from an earlier tool set must not survive.
     await writeBridgeConfig(dir, [toolWithSchema("old_tool", {})]);
     await writeBridgeConfig(dir, tools);
+    // A title request would share the free tier's rate limit with the turn.
+    assert.equal(readFileSync(join(dir, ".opencode", "agents", "title.md"), "utf8"), "---\ndisable: true\n---\n");
 
     const toolsDir = join(dir, ".opencode", "tools");
     assert.deepEqual(
