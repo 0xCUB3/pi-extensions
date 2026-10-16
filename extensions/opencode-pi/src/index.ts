@@ -1056,7 +1056,7 @@ function buildContinuationPrompt(deltaParts: string[]): string {
   return [
     "# Continued Pi/OpenCode bridge turn",
     "",
-    "Pi handled the tool calls from your last step. OpenCode reports them as rejected only because Pi, not OpenCode, runs them.",
+    "Pi handled the tool calls from your last step. OpenCode reports them as rejected only because Pi, not OpenCode, runs them. Their results are below, and your tools still work: keep calling them whenever the task needs another step.",
     "",
     "# New transcript since your last response",
     "",
@@ -1109,25 +1109,49 @@ export function openCodeToolArgs(tool: Tool): Record<string, JsonSchema> {
       name,
       required.includes(name)
         ? schema
-        : { description: schema.description, anyOf: [schema, { type: "null" }] },
+        : {
+            description: [schema.description, "Optional: pass null to leave it unset."].filter(Boolean).join(" "),
+            anyOf: [schema, { type: "null" }],
+          },
     ]),
   );
 }
 
+/** Keep only Pi's declared arguments, dropping nulls for optional ones. */
 export function piArguments(tool: Tool, input: unknown): ToolCall["arguments"] {
   if (typeof input !== "object" || input === null || Array.isArray(input)) return {};
-  const { required = [] } = parameterSchema(tool);
+  const { properties, required = [] } = parameterSchema(tool);
+  const declared = properties && Object.keys(properties).length > 0 ? properties : undefined;
   return Object.fromEntries(
     Object.entries(input).filter(
-      ([name, value]) => value !== null || required.includes(name),
+      ([name, value]) =>
+        (!declared || name in declared) && (value !== null || required.includes(name)),
     ),
   ) as ToolCall["arguments"];
 }
 
+/**
+ * OpenCode only treats zod arguments as optional, so each Pi argument becomes
+ * `z.any()` carrying its original JSON Schema as metadata. OpenCode installs
+ * `@opencode-ai/plugin` (and its zod) into every project before it loads
+ * custom tools. If that install failed, fall back to the nullable arguments.
+ */
 function piToolSource(tool: Tool): string {
-  return `export default {
+  const { properties = {}, required = [] } = parameterSchema(tool);
+  return `let z;
+try {
+  z = (await import("@opencode-ai/plugin")).tool.schema;
+} catch {}
+const properties = ${JSON.stringify(properties)};
+const required = ${JSON.stringify(required)};
+export default {
   description: ${JSON.stringify(tool.description ?? "")},
-  args: ${JSON.stringify(openCodeToolArgs(tool))},
+  args: z
+    ? Object.fromEntries(Object.entries(properties).map(([name, schema]) => {
+        const arg = z.any().meta(schema);
+        return [name, required.includes(name) ? arg : arg.optional()];
+      }))
+    : ${JSON.stringify(openCodeToolArgs(tool))},
   async execute(_args, context) {
     await context.ask({ permission: ${JSON.stringify(PI_TOOL_PERMISSION)}, patterns: ["*"], always: [], metadata: {} });
     return "Pi runs this tool and sends the result in the next message.";
@@ -1155,7 +1179,11 @@ function unavailableToolSource(available: string[]): string {
  * OpenCode tool the agent can see is one of these files. Pi tools never run
  * inside OpenCode, and the unavailable stubs only return a message.
  */
-export async function writeBridgeConfig(dir: string, tools: Tool[]): Promise<void> {
+export async function writeBridgeConfig(
+  dir: string,
+  tools: Tool[],
+  dialect: CliDialect = "v1",
+): Promise<void> {
   const piNames = tools.map((tool) => tool.name);
   const invalid = piNames.find((name) => !TOOL_NAME_PATTERN.test(name));
   if (invalid) {
@@ -1183,11 +1211,16 @@ export async function writeBridgeConfig(dir: string, tools: Tool[]): Promise<voi
       );
     }),
   );
-  const permissions = [
-    `  "*": deny`,
-    ...[...allowed].map((key) => `  ${JSON.stringify(key)}: allow`),
-    `  ${JSON.stringify(PI_TOOL_PERMISSION)}: ask`,
-  ];
+  // v2 ignores custom tools and maps the `bash` key onto its own `shell`,
+  // so it would run its built-in tools. Asking for everything makes `opencode
+  // run` reject each call instead, which hands it to Pi.
+  const permissions = dialect === "v2"
+    ? [`  "*": ask`]
+    : [
+        `  "*": deny`,
+        ...[...allowed].map((key) => `  ${JSON.stringify(key)}: allow`),
+        `  ${JSON.stringify(PI_TOOL_PERMISSION)}: ask`,
+      ];
   await writeFile(
     join(configDir, "agents", `${AGENT_ID}.md`),
     `---
@@ -1213,11 +1246,11 @@ const configuredDirs = new Map<string, string>();
  * Write the bridge config when the tool list changed. Returns true when the
  * server may still hold the directory's old config.
  */
-async function syncBridgeConfig(dir: string, tools: Tool[]): Promise<boolean> {
-  const key = serializeTools(tools);
+async function syncBridgeConfig(dir: string, tools: Tool[], dialect: CliDialect): Promise<boolean> {
+  const key = `${dialect}:${serializeTools(tools)}`;
   const previous = configuredDirs.get(dir);
   if (previous === key) return false;
-  await writeBridgeConfig(dir, tools);
+  await writeBridgeConfig(dir, tools, dialect);
   configuredDirs.set(dir, key);
   return previous !== undefined;
 }
@@ -1457,13 +1490,13 @@ export function streamOpenCode(
             tempDir = dir;
             return dir;
           });
-      const staleInstance = await syncBridgeConfig(sessionDir, context.tools);
+      const dialect = await cliDialect();
+      const staleInstance = await syncBridgeConfig(sessionDir, context.tools, dialect);
       if (options?.signal?.aborted) throw new Error("Request was aborted");
       const files = imageFileParts(
         imageContentsForModel(sentMessages, model.input.includes("image")),
       );
       if (options?.signal?.aborted) throw new Error("Request was aborted");
-      const dialect = await cliDialect();
       const reasoning = (options?.reasoning as ModelThinkingLevel | undefined) ?? "off";
       const variant = model.thinkingLevelMap?.[reasoning];
       const slash = model.id.indexOf("/");
@@ -1499,7 +1532,8 @@ export function streamOpenCode(
         const child = spawn(opencodeBin(), args, {
           cwd: sessionDir,
           stdio: ["pipe", "pipe", "pipe"],
-          env: { ...process.env, OPENCODE_DISABLE_UPDATE_CHECK: "1" },
+          // v2 resolves the project from PWD, which spawn leaves at Pi's cwd.
+          env: { ...process.env, PWD: sessionDir, OPENCODE_DISABLE_UPDATE_CHECK: "1" },
         });
         const kill = () => child.kill("SIGTERM");
         controller.signal.addEventListener("abort", kill, { once: true });
@@ -1509,8 +1543,11 @@ export function streamOpenCode(
         let stderr = "";
         let remainder = "";
         let lineCount = 0;
+        // v2 answers a rejected ask to the model and keeps going, so the run
+        // ends once the step holding Pi's tool calls finishes.
+        let handedOff = false;
         const handleLine = (line: string) => {
-          if (!line.trim()) return;
+          if (handedOff || !line.trim()) return;
           let event: any;
           try {
             event = JSON.parse(line);
@@ -1532,10 +1569,16 @@ export function streamOpenCode(
                   sessionID: sessionId,
                   id: part.partID ?? part.id ?? `${event.type}-${lineCount++}`,
                   callID: part.callID ?? part.id,
+                  // v2's built-in shell is Pi's bash.
+                  ...(part.tool === "shell" ? { tool: "bash" } : {}),
                   time: { ...part.time, end: part.time?.end ?? Date.now() },
                 },
               },
             }, async () => undefined);
+            if (type === "step-finish" && toolCalls.length > 0) {
+              handedOff = true;
+              child.kill("SIGTERM");
+            }
           } else if (event.type === "error") {
             void handleEvent({ type: "session.error", properties: { sessionID: sessionId, error: event.error } }, async () => undefined);
           }
@@ -1557,7 +1600,7 @@ export function streamOpenCode(
         }).finally(() => controller.signal.removeEventListener("abort", kill));
         handleLine(remainder);
         if (controller.signal.aborted) throw turnStopped();
-        if (code !== 0 && !opencodeError) {
+        if (code !== 0 && !opencodeError && !handedOff) {
           throw new Error(stderr.trim() || `opencode exited with code ${code}`);
         }
       };
