@@ -10,7 +10,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { parseEvents, runningOpenCodeServer, stopOpenCodeServer, withOpenCodeServer } from "./server.js";
 import test from "node:test";
@@ -45,8 +45,12 @@ import opencodePiExtension, {
   streamOpenCode,
   showOpenCodePanelList,
   trackedPiSessionCount,
+  whenStartupChecked,
   writeBridgeConfig,
 } from "./index.js";
+
+// Keep the model cache out of the real Pi agent directory.
+process.env.PI_CODING_AGENT_DIR = mkdtempSync(join(tmpdir(), "opencode-pi-agent-"));
 
 function fakeModel(): Model<Api> {
   return {
@@ -1216,7 +1220,7 @@ test("extension registration preserves discovered model capabilities", async () 
           },
           on() {},
           registerCommand() {},
-        } as unknown as ExtensionAPI),
+        } as unknown as ExtensionAPI).then(whenStartupChecked),
     );
 
     assert.equal(providerId, "opencode-cli");
@@ -1326,6 +1330,7 @@ function sessionStartRecorder() {
     async run(ctx: NotifyCtx) {
       if (!handler) throw new Error("session_start handler not registered");
       await handler({}, ctx);
+      await whenStartupChecked();
     },
   };
 }
@@ -1411,7 +1416,10 @@ process.stdout.write([
   "opencode/one-free",
   JSON.stringify({ capabilities: {} }),
 ].join("\\n"));`,
-      () => opencodePiExtension(recorder.extension),
+      async () => {
+        await opencodePiExtension(recorder.extension);
+        await whenStartupChecked();
+      },
     );
 
     const ctx = recordingCtx();
@@ -1425,6 +1433,63 @@ process.stdout.write([
     assert.match(info?.message ?? "", /registered \d+ OpenCode CLI model\(s\)/);
   } finally {
     restoreEnv("OPENCODE_PI_MODELS", previousModels);
+  }
+});
+
+test("the extension registers cached models without waiting on the CLI", async () => {
+  const previousModels = process.env.OPENCODE_PI_MODELS;
+  delete process.env.OPENCODE_PI_MODELS;
+  let registered: string[] = [];
+  try {
+    await withFakeOpenCode(
+      // A CLI that takes 2s to answer anything.
+      `setTimeout(() => process.stdout.write("opencode/fresh-free\\n"), 2000);`,
+      async () => {
+        const cache = join(process.env.PI_CODING_AGENT_DIR!, "cache", "opencode-pi-models.json");
+        mkdirSync(dirname(cache), { recursive: true });
+        writeFileSync(cache, JSON.stringify({ bin: process.env.OPENCODE_PI_BIN, models: [{ id: "opencode/cached-free", name: "Cached", reasoning: false, image: false, contextWindow: 1000, maxTokens: 100, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }] }));
+        const extension = {
+          registerProvider(_id: string, config: { models: { id: string }[] }) {
+            registered = config.models.map((model) => model.id);
+          },
+          on() {},
+          registerCommand() {},
+        } as unknown as ExtensionAPI;
+        const started = Date.now();
+        await opencodePiExtension(extension);
+        assert.ok(Date.now() - started < 1000, `startup took ${Date.now() - started}ms`);
+        assert.deepEqual(registered, ["opencode/cached-free"]);
+        // Background discovery replaces them once the CLI answers.
+        await whenStartupChecked();
+        assert.deepEqual(registered, ["opencode/fresh-free"]);
+      },
+    );
+  } finally {
+    restoreEnv("OPENCODE_PI_MODELS", previousModels);
+  }
+});
+
+test("discoverModels skips the v2 API on a v1 CLI and keeps errors to one line", async () => {
+  const previousModels = process.env.OPENCODE_PI_MODELS;
+  delete process.env.OPENCODE_PI_MODELS;
+  const logDir = mkdtempSync(join(tmpdir(), "opencode-pi-argv-"));
+  const log = join(logDir, "argv.log");
+  try {
+    const { error } = await withFakeOpenCode(
+      `require("node:fs").appendFileSync(${JSON.stringify(log)}, process.argv.slice(2).join(" ") + "\\n");
+process.stderr.write("\\x1b[91mError: \\x1b[0mUnexpected error\\n\\nno such column: project_id\\n");
+process.exit(1);`,
+      () => discoverModels(),
+      "1.19.3",
+    );
+    assert.deepEqual(readFileSync(log, "utf8").trim().split("\n"), ["models opencode --verbose", "models"]);
+    assert.equal(
+      error,
+      "opencode models opencode --verbose: Error: Unexpected error no such column: project_id | opencode models: Error: Unexpected error no such column: project_id",
+    );
+  } finally {
+    restoreEnv("OPENCODE_PI_MODELS", previousModels);
+    rmSync(logDir, { recursive: true, force: true });
   }
 });
 

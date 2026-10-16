@@ -1,9 +1,9 @@
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { dirname, join } from "node:path";
+import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   calculateCost,
   createAssistantMessageEventStream,
@@ -209,15 +209,47 @@ async function cliDialect(forceVersion = false): Promise<CliDialect> {
   const bin = opencodeBin();
   if (!forceVersion && detectedCli?.bin === bin) return detectedCli.dialect;
   const result = await runCapture(["--version"], undefined, STATUS_TIMEOUT_MS);
-  const version = (result.stdout.trim() || result.stderr.trim()).match(
-    /^(?:opencode\s+)?v?(\d+)\.\d+\.\d+(?:[-+][\w.-]+)?$/i,
-  );
-  if (result.code !== 0 || !version || Number(version[1]) < 1) {
+  const dialect = result.code === 0 ? dialectOf(result.stdout.trim() || result.stderr.trim()) : undefined;
+  if (!dialect) {
     throw new Error("Cannot determine OpenCode CLI version for run arguments");
   }
-  const dialect: CliDialect = Number(version[1]) >= 2 ? "v2" : "v1";
   detectedCli = { bin, dialect };
   return dialect;
+}
+
+function dialectOf(version: string): CliDialect | undefined {
+  const major = Number(version.match(/^(?:opencode\s+)?v?(\d+)\.\d+\.\d+(?:[-+][\w.-]+)?$/i)?.[1]);
+  if (!(major >= 1)) return undefined;
+  return major >= 2 ? "v2" : "v1";
+}
+
+/** CLI failures can print a whole help screen; keep one short line. */
+function conciseError(text: string): string {
+  const line = text.replace(/\x1b\[[0-9;]*m/g, "").replace(/\s+/g, " ").trim();
+  return line.length > 200 ? `${line.slice(0, 197)}...` : line;
+}
+
+// Discovered models are cached so startup can register them without
+// waiting on the CLI.
+function modelCachePath(): string {
+  return join(getAgentDir(), "cache", "opencode-pi-models.json");
+}
+
+async function readModelCache(): Promise<OpenCodeModelInfo[] | undefined> {
+  try {
+    const cache = JSON.parse(await readFile(modelCachePath(), "utf8"));
+    return cache?.bin === opencodeBin() && Array.isArray(cache.models) && cache.models.length > 0
+      ? cache.models
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function writeModelCache(models: OpenCodeModelInfo[]): Promise<void> {
+  const path = modelCachePath();
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, JSON.stringify({ bin: opencodeBin(), models }), "utf8");
 }
 
 function opencodeBin(): string {
@@ -636,6 +668,8 @@ export async function checkCliStatus(): Promise<CliStatus> {
     }
     const version =
       result.stdout.trim() || result.stderr.trim() || "OpenCode CLI is available";
+    const dialect = dialectOf(version);
+    if (dialect) detectedCli = { bin: opencodeBin(), dialect };
     return { ok: true, summary: version };
   } catch (error) {
     return {
@@ -672,7 +706,11 @@ export async function discoverModels(opts?: {
   }
 
   const errors: string[] = [];
+  // The version picks the metadata call this CLI has; an unknown version
+  // tries them all.
+  const dialect = await cliDialect(opts?.forceDiscovery).catch(() => undefined);
   for (const attempt of DISCOVERY_ATTEMPTS) {
+    if (dialect && attempt.dialect && attempt.dialect !== dialect) continue;
     try {
       const metadata = await attempt.run();
       if (metadata.length === 0) {
@@ -688,13 +726,15 @@ export async function discoverModels(opts?: {
         throw new Error("discovery returned no free models");
       }
 
-      const dialect = attempt.dialect ?? (await cliDialect(true));
-      detectedCli = { bin: opencodeBin(), dialect };
+      if (!dialect && attempt.dialect) {
+        detectedCli = { bin: opencodeBin(), dialect: attempt.dialect };
+      }
       lastDiscoveryError = undefined;
+      if (!configured?.length) await writeModelCache(selected).catch(() => undefined);
       return { models: selected, time: Date.now(), error: undefined };
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
-      errors.push(`${attempt.label}: ${detail}`);
+      errors.push(`${attempt.label}: ${conciseError(detail)}`);
     }
   }
 
@@ -719,23 +759,7 @@ async function refreshModels(
   });
   registeredModels = models;
   lastDiscoveryTime = time;
-
-  // Re-register the provider with the updated model list
-  const providerConfig: Parameters<ExtensionAPI["registerProvider"]>[1] = {
-    name: "OpenCode CLI",
-    baseUrl: "cli:opencode",
-    apiKey: "opencode-cli-no-api-key",
-    api: API_ID,
-    models: models.map(providerModel),
-    streamSimple: streamOpenCode,
-  };
-
-  try {
-    pi.registerProvider(PROVIDER_ID, providerConfig);
-  } catch {
-    // registerProvider may reject if already registered; the models array is already updated.
-  }
-  registerApiHandler();
+  registerModels(pi);
 
   const newModels = models.filter((model) => !previousModels.has(model.id));
 
@@ -1769,20 +1793,54 @@ function registerApiHandler(): void {
   );
 }
 
-export default async function opencodePiExtension(pi: ExtensionAPI) {
-  const { models, time } = await discoverModels();
-  registeredModels = models;
-  lastDiscoveryTime = time;
-
-  pi.registerProvider(PROVIDER_ID, {
-    name: "OpenCode CLI",
-    baseUrl: "cli:opencode",
-    apiKey: "opencode-cli-no-api-key",
-    api: API_ID,
-    models: registeredModels.map(providerModel),
-    streamSimple: streamOpenCode,
-  });
+function registerModels(pi: ExtensionAPI): void {
+  try {
+    pi.registerProvider(PROVIDER_ID, {
+      name: "OpenCode CLI",
+      baseUrl: "cli:opencode",
+      apiKey: "opencode-cli-no-api-key",
+      api: API_ID,
+      models: registeredModels.map(providerModel),
+      streamSimple: streamOpenCode,
+    });
+  } catch {
+    // registerProvider may reject if already registered; the models array is already updated.
+  }
   registerApiHandler();
+}
+
+let startupCheck: Promise<CliStatus> = Promise.resolve({ ok: true, summary: "" });
+
+/** Settles once the background CLI check and model discovery finish. */
+export function whenStartupChecked(): Promise<CliStatus> {
+  return startupCheck;
+}
+
+async function checkCliAndDiscover(pi: ExtensionAPI): Promise<CliStatus> {
+  const status = await checkCliStatus();
+  lastCliAvailable = status.ok;
+  if (!status.ok) return status;
+  const { models, time } = await discoverModels();
+  lastDiscoveryTime = time;
+  if (JSON.stringify(models) !== JSON.stringify(registeredModels)) {
+    registeredModels = models;
+    registerModels(pi);
+  }
+  return status;
+}
+
+export default async function opencodePiExtension(pi: ExtensionAPI) {
+  // Register the last discovered models (or the defaults) right away and
+  // ask the CLI in the background, so loading Pi never waits on OpenCode.
+  const known = configuredModels()?.length
+    ? (await discoverModels()).models
+    : await readModelCache();
+  registeredModels = known ?? DEFAULT_FREE_MODELS.map(fallbackModel);
+  registerModels(pi);
+  startupCheck = checkCliAndDiscover(pi);
+  // The first start has no cache, and Pi may ask for a model only
+  // discovery knows, so that one start waits.
+  if (!known) await startupCheck;
 
   // Tear down per-Pi-session OpenCode state — project directories and
   // session records — when the Pi session ends for any reason (#74).
@@ -1790,9 +1848,11 @@ export default async function opencodePiExtension(pi: ExtensionAPI) {
     void cleanupPiSessionState();
   });
 
-  pi.on("session_start", async (_event: any, ctx: any) => {
-    const cliStatus = await checkCliStatus();
-    lastCliAvailable = cliStatus.ok;
+  pi.on("session_start", (_event: any, ctx: any) => {
+    void startupCheck.then((cliStatus) => notifyStartup(ctx, cliStatus));
+  });
+
+  function notifyStartup(ctx: any, cliStatus: CliStatus): void {
     if (!cliStatus.ok) {
       const fastPathConfigured = Boolean(configuredModels()?.length);
       const fastPathNote = fastPathConfigured
@@ -1814,7 +1874,7 @@ export default async function opencodePiExtension(pi: ExtensionAPI) {
         "warning",
       );
     }
-  });
+  }
 
   pi.registerCommand("opencode-pi", {
     description: "OpenCode CLI bridge status and setup help",
