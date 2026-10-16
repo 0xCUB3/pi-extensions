@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import {
   chmodSync,
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
@@ -347,13 +348,43 @@ test("openCodeToolArgs keeps required arguments and makes optional ones nullable
   assert.deepEqual(openCodeToolArgs(tool), {
     path: { type: "string", description: "File path" },
     limit: {
-      description: "Max lines",
+      description: "Max lines Optional: pass null to leave it unset.",
       anyOf: [{ type: "number", description: "Max lines" }, { type: "null" }],
     },
   });
   assert.deepEqual(piArguments(tool, { path: "a.txt", limit: null }), { path: "a.txt" });
   assert.deepEqual(piArguments(tool, { path: "a.txt", limit: 5 }), { path: "a.txt", limit: 5 });
   assert.deepEqual(piArguments(tool, "not an object"), {});
+});
+
+test("writeBridgeConfig declares optional Pi arguments as optional zod arguments", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "opencode-pi-config-"));
+  try {
+    // A stand-in for the @opencode-ai/plugin package OpenCode installs.
+    const plugin = join(dir, ".opencode", "node_modules", "@opencode-ai", "plugin");
+    mkdirSync(plugin, { recursive: true });
+    writeFileSync(join(plugin, "package.json"), JSON.stringify({ name: "@opencode-ai/plugin", type: "module", main: "index.js" }));
+    writeFileSync(
+      join(plugin, "index.js"),
+      `const any = () => ({ meta: (schema) => ({ schema, optional() { return { schema, optional: true }; } }) });
+export const tool = { schema: { any } };
+`,
+    );
+    await writeBridgeConfig(dir, [
+      toolWithSchema("bash", {
+        type: "object",
+        properties: { command: { type: "string" }, timeout: { type: "number", minimum: 1 } },
+        required: ["command"],
+      }),
+    ]);
+    const bash = (await import(pathToFileURL(join(dir, ".opencode", "tools", "bash.js")).href)).default;
+    assert.deepEqual(JSON.parse(JSON.stringify(bash.args)), {
+      command: { schema: { type: "string" } },
+      timeout: { schema: { type: "number", minimum: 1 }, optional: true },
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("writeBridgeConfig exposes only Pi tools and inert stubs to OpenCode", async () => {
@@ -666,6 +697,7 @@ test("streamOpenCode uses v2 model variants and isolated project agent without v
 fs.writeFileSync(${JSON.stringify(capturePath)}, JSON.stringify({
   args: process.argv.slice(2),
   cwd: process.cwd(),
+  pwd: fs.realpathSync(process.env.PWD),
   agent: fs.readFileSync(".opencode/agents/pi-model.md", "utf8"),
 }));
 process.stdout.write(JSON.stringify({ type: "text", part: { text: "ok" } }) + "\\n");`,
@@ -678,18 +710,55 @@ process.stdout.write(JSON.stringify({ type: "text", part: { text: "ok" } }) + "\
     const invocation = JSON.parse(readFileSync(capturePath, "utf8")) as {
       args: string[];
       cwd: string;
+      pwd: string;
       agent: string;
     };
+    // v2 reads the project directory from PWD, not the process cwd.
+    assert.equal(invocation.pwd, invocation.cwd);
     assert.deepEqual(invocation.args, [
       "run", "--standalone", "-m", "opencode/fake-free#low",
       "--agent", "pi-model", "--format", "json", "--thinking",
     ]);
     assert.match(invocation.agent, /mode: primary/);
-    assert.match(invocation.agent, /\n  "read": allow\n/);
+    // v2 would run its own tools under any allow rule.
+    assert.match(invocation.agent, /permission:\n  "\*": ask\n---/);
     assert.match(invocation.cwd, /opencode-pi-/);
   } finally {
     rmSync(captureDir, { recursive: true, force: true });
   }
+});
+
+test("streamOpenCode ends an OpenCode v2 run once Pi's tool calls are in", async () => {
+  const started = Date.now();
+  const message = await withFakeOpenCode(
+    `if (process.argv[2] === "session") process.exit(0);
+process.stdin.resume();
+process.stdin.on("end", () => {
+  const emit = (type, part) => process.stdout.write(JSON.stringify({ type, sessionID: "ses-v2", part }) + "\\n");
+  emit("tool_use", { partID: "prt_tool", type: "tool", id: "call_v2", tool: "read", state: { status: "error", input: { path: "a.txt" } } });
+  emit("tool_use", { partID: "prt_sh", type: "tool", id: "call_sh", tool: "shell", state: { status: "error", input: { command: "ls", workdir: "/" } } });
+  emit("step_finish", { id: "prt_f", type: "step-finish", reason: "tool-calls" });
+  // v2 hands the rejection back to the model, which then guesses.
+  emit("text", { id: "prt_t", type: "text", text: "a.txt does not exist." });
+  setInterval(() => undefined, 1_000);
+});`,
+    () =>
+      streamOpenCode(fakeModel(), {
+        messages: [],
+        tools: [
+          toolWithSchema("read", { type: "object", properties: { path: { type: "string" } }, required: ["path"] }),
+          toolWithSchema("bash", { type: "object", properties: { command: { type: "string" } }, required: ["command"] }),
+        ],
+      }).result(),
+    "opencode v2.0.16",
+  );
+  assert.equal(message.stopReason, "toolUse");
+  // v2's shell is Pi's bash; arguments Pi does not declare are dropped.
+  assert.deepEqual(message.content, [
+    { type: "toolCall", id: "call_v2", name: "read", arguments: { path: "a.txt" } },
+    { type: "toolCall", id: "call_sh", name: "bash", arguments: { command: "ls" } },
+  ]);
+  assert.ok(Date.now() - started < 5_000);
 });
 
 test("streamOpenCode leaves v2 model ID unsuffixed without a selected variant", async () => {
